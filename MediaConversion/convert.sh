@@ -2,9 +2,10 @@
 # convert.sh
 #
 # MKV -> MP4 (Plex on Apple TV 4K optimized)
-# - Automatic MKV repair (mkvmerge preferred, ffmpeg copy fallback)
-# - Keep English audio (prefer highest-channel English); keep 5.1 when possible + add AAC stereo fallback
-# - Forced subtitles: if forced subs exist -> burn-in with CPU (x264); otherwise use Intel QSV HEVC (fast)
+# - Automatic MKV repair retry in auto mode (mkvmerge preferred, ffmpeg copy fallback)
+# - Keep English audio only (prefer highest-channel English); keep 5.1 when possible + add AAC stereo fallback
+# - Forced English subtitles only: burn/copy/extract modes; always drop non-English subtitles
+# - Fast path: copy compatible H.264/HEVC video into MP4 when burn-in is not needed
 # - Always do OMDb lookup (omdbapi.com)
 # - Download poster (if available)
 # - Embed poster + metadata into produced MP4
@@ -39,6 +40,9 @@
 #   TV_MAX_BYTES=$((700*1024*1024)) ./convert.sh
 #     - Aim to keep TV episodes under ~700 MiB (best-effort bitrate cap).
 #
+#   REPAIR_MODE=auto SUBTITLE_MODE=extract ./convert.sh
+#     - Retry with a repaired MKV only after a conversion failure; extract forced English subtitles as sidecars.
+#
 set -uo pipefail
 shopt -s nullglob
 
@@ -54,7 +58,8 @@ Usage:
   ./convert.sh                       # normal convert mode
   ./convert.sh --print-subs-only     # scan current dir for MKV and report forced English subtitles
 Environment overrides:
-  FFMPEG, FFPROBE, JOBS, VERBOSE, OMDB_API_KEY, OMDB_INTERACTIVE, ...
+  FFMPEG, FFPROBE, JOBS, VERBOSE, OMDB_API_KEY, OMDB_INTERACTIVE,
+  REPAIR_MODE=auto|always|never, SUBTITLE_MODE=burn|copy|extract, FAST_VIDEO_COPY=0|1, ...
 EOF
   exit 0
 fi
@@ -75,6 +80,9 @@ OMDB_URL="${OMDB_URL:-https://www.omdbapi.com}"
 OMDB_LOG="${OMDB_LOG:-omdb_tagging_log.csv}"
 OMDB_LOG_LOCK="${OMDB_LOG_LOCK:-${OMDB_LOG}.lock}"
 OMDB_INTERACTIVE="${OMDB_INTERACTIVE:-1}"
+REPAIR_MODE="${REPAIR_MODE:-auto}"      # auto|always|never
+SUBTITLE_MODE="${SUBTITLE_MODE:-burn}"  # burn|copy|extract
+FAST_VIDEO_COPY="${FAST_VIDEO_COPY:-1}" # 1 = copy compatible H.264/HEVC video when possible
 FIX_TIMESTAMPS="${FIX_TIMESTAMPS:-1}"
 QSV_GLOBAL_QUALITY="${QSV_GLOBAL_QUALITY:-22}"
 QSV_PRESET="${QSV_PRESET:-medium}"
@@ -95,6 +103,30 @@ if [[ "$FIX_TIMESTAMPS" == "1" ]]; then
   TIMING_OUT_FLAGS=(-vsync vfr)
 fi
 
+case "$REPAIR_MODE" in
+  auto|always|never) ;;
+  *)
+    echo "[ERROR] Invalid REPAIR_MODE: ${REPAIR_MODE} (expected auto|always|never)" >&2
+    exit 1
+    ;;
+esac
+
+case "$SUBTITLE_MODE" in
+  burn|copy|extract) ;;
+  *)
+    echo "[ERROR] Invalid SUBTITLE_MODE: ${SUBTITLE_MODE} (expected burn|copy|extract)" >&2
+    exit 1
+    ;;
+esac
+
+case "$FAST_VIDEO_COPY" in
+  0|1) ;;
+  *)
+    echo "[ERROR] Invalid FAST_VIDEO_COPY: ${FAST_VIDEO_COPY} (expected 0 or 1)" >&2
+    exit 1
+    ;;
+esac
+
 ############################################
 # Hard-stop on Ctrl-C: kill entire process group
 ############################################
@@ -109,6 +141,7 @@ echo "========================================" >&2
 echo "convert.sh — MKV → MP4 batch converter" >&2
 echo "Found ${#FILES[@]} MKV file(s) in $(pwd)" >&2
 echo "Parallel jobs: ${JOBS}  OMDb interactive: ${OMDB_INTERACTIVE}  VERBOSE: ${VERBOSE}" >&2
+echo "Repair mode: ${REPAIR_MODE}  Subtitle mode: ${SUBTITLE_MODE}  Fast video copy: ${FAST_VIDEO_COPY}" >&2
 echo "TV max bytes: ${TV_MAX_BYTES}" >&2
 echo "========================================" >&2
 
@@ -520,6 +553,321 @@ x264_extra_args() {
   printf '%s\n' "${x[@]}"
 }
 
+get_video_codec_name() {
+  "$FFPROBE" -v error -select_streams v:0 \
+    -show_entries stream=codec_name \
+    -of csv=p=0 "$1" | head -n1
+}
+
+video_codec_can_copy_to_mp4() {
+  local codec="$1"
+  [[ "$codec" == "h264" || "$codec" == "hevc" ]]
+}
+
+get_subtitle_codec_by_pos() {
+  local file="$1" subpos="$2"
+  "$FFPROBE" -v error -select_streams s \
+    -show_entries stream=codec_name \
+    -of csv=p=0 "$file" | awk -v pos="$subpos" 'NR-1==pos { print; exit }'
+}
+
+subtitle_codec_supports_mov_text() {
+  local codec="$1"
+  case "$codec" in
+    mov_text|subrip|ass|ssa|webvtt)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+file_size_bytes() {
+  local path="$1"
+  stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null
+}
+
+can_use_fast_video_copy() {
+  local file="$1" detected_type="$2" video_codec="$3" subtitle_action="$4"
+  [[ "$FAST_VIDEO_COPY" == "1" ]] || return 1
+  [[ "$subtitle_action" != "burn" ]] || return 1
+  video_codec_can_copy_to_mp4 "$video_codec" || return 1
+
+  if [[ "$detected_type" == "tv" ]]; then
+    local source_size
+    source_size="$(file_size_bytes "$file" 2>/dev/null || true)"
+    [[ -n "$source_size" ]] || return 1
+    [[ "$source_size" -le "$TV_MAX_BYTES" ]] || return 1
+  fi
+
+  return 0
+}
+
+extract_forced_eng_subtitle() {
+  local file="$1" subpos="$2" subcodec="$3" out_mp4="$4"
+  [[ -n "$subpos" ]] || return 0
+
+  local sidecar codec_arg ext
+  case "$subcodec" in
+    mov_text|subrip)
+      ext="srt"
+      codec_arg="srt"
+      ;;
+    webvtt)
+      ext="vtt"
+      codec_arg="webvtt"
+      ;;
+    ass|ssa)
+      ext="ass"
+      codec_arg="ass"
+      ;;
+    *)
+      ext="mks"
+      codec_arg="copy"
+      ;;
+  esac
+
+  sidecar="$(unique_path "${out_mp4%.*}.en.forced.${ext}")"
+  echo "[SUBS ] Extracting forced English subtitle to $(basename "$sidecar")" >&2
+
+  if [[ "$codec_arg" == "copy" ]]; then
+    "$FFMPEG" -y -v warning \
+      -i "$file" \
+      -map "0:s:${subpos}" \
+      -map_metadata -1 \
+      -c:s copy \
+      "$sidecar" >/dev/null 2>&1
+  else
+    "$FFMPEG" -y -v warning \
+      -i "$file" \
+      -map "0:s:${subpos}" \
+      -map_metadata -1 \
+      -c:s "$codec_arg" \
+      "$sidecar" >/dev/null 2>&1
+  fi
+}
+
+convert_from_source() {
+  local src="$1" out="$2" detected_type="$3" original_in="$4"
+  local astream_idx acodec ach video_codec
+  local forced_eng_sub_pos="" subtitle_codec="" subtitle_action="none"
+  local VIDEO_BITRATE="" encode_ok=0
+  local -a audio_args=() x264_extras=() subtitle_args=() video_copy_args=()
+  local subfile_esc vf_arg duration target_bps ac3_kbps aac_kbps audio_total_kbps audio_total_bps video_bps video_kbps final_size
+
+  astream_idx="$(pick_best_eng_audio_stream_index "$src")"
+  if [[ -z "$astream_idx" ]]; then
+    echo "[FAIL ] no English audio stream found: $original_in" >&2
+    return 20
+  fi
+
+  IFS=',' read -r acodec ach <<< "$(get_audio_codec_and_channels "$src" "$astream_idx")"
+  mapfile -t audio_args < <(build_audio_args_with_stereo_fallback "$astream_idx" "$acodec" "$ach")
+  mapfile -t x264_extras < <(x264_extra_args)
+  video_codec="$(get_video_codec_name "$src")"
+
+  echo "[AUDIO] primary=0:${astream_idx} codec=${acodec} ch=${ach} (English only; stereo fallback if 5.1+)" >&2
+  [[ -n "$video_codec" ]] && echo "[VIDEO] source codec=${video_codec}" >&2
+
+  forced_eng_sub_pos="$(pick_forced_eng_sub_pos "$src" || true)"
+  if [[ -n "$forced_eng_sub_pos" ]]; then
+    subtitle_codec="$(get_subtitle_codec_by_pos "$src" "$forced_eng_sub_pos")"
+    case "$SUBTITLE_MODE" in
+      burn)
+        subtitle_action="burn"
+        ;;
+      copy)
+        if subtitle_codec_supports_mov_text "$subtitle_codec"; then
+          subtitle_action="copy"
+          subtitle_args=(-map "0:s:${forced_eng_sub_pos}" -c:s mov_text -metadata:s:s:0 language=eng -disposition:s:0 forced)
+        else
+          subtitle_action="extract"
+          echo "[WARN ] Forced English subtitle codec '${subtitle_codec:-unknown}' is not MP4 text-compatible; extracting a sidecar instead." >&2
+        fi
+        ;;
+      extract)
+        subtitle_action="extract"
+        ;;
+    esac
+  fi
+
+  case "$subtitle_action" in
+    burn)
+      echo "[SUBS ] Forced English subtitles -> burn into video" >&2
+      subfile_esc="$(ffmpeg_subtitles_filter_escape "$src")"
+      vf_arg="subtitles='${subfile_esc}':si=${forced_eng_sub_pos}"
+      ;;
+    copy)
+      echo "[SUBS ] Forced English subtitles -> keep in MP4 as mov_text" >&2
+      ;;
+    extract)
+      echo "[SUBS ] Forced English subtitles -> extract sidecar after conversion" >&2
+      ;;
+    none)
+      echo "[SUBS ] No forced English subtitles kept" >&2
+      ;;
+  esac
+
+  if can_use_fast_video_copy "$src" "$detected_type" "$video_codec" "$subtitle_action"; then
+    echo "[FAST ] Compatible ${video_codec} video -> MP4 copy path" >&2
+    video_copy_args=(-c:v copy)
+    [[ "$video_codec" == "hevc" ]] && video_copy_args+=(-tag:v hvc1)
+
+    if "$FFMPEG" -y -stats \
+        "${TIMING_IN_FLAGS[@]}" \
+        -i "$src" \
+        "${TIMING_OUT_FLAGS[@]}" \
+        -map 0:v:0 \
+        "${audio_args[@]}" \
+        "${subtitle_args[@]}" \
+        "${video_copy_args[@]}" \
+        -movflags +faststart "$out"; then
+      if [[ "$subtitle_action" == "extract" ]]; then
+        extract_forced_eng_subtitle "$src" "$forced_eng_sub_pos" "$subtitle_codec" "$out" || \
+          echo "[WARN ] Failed to extract forced English subtitle sidecar" >&2
+      fi
+      return 0
+    fi
+
+    rm -f "$out"
+    echo "[WARN ] Fast video copy failed; falling back to encode path" >&2
+  fi
+
+  if [[ "$detected_type" == "tv" ]]; then
+    duration="$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$src" 2>/dev/null || echo "")"
+    if [[ -n "$duration" ]]; then
+      if awk "BEGIN{exit !($duration > 0)}"; then
+        target_bps="$(awk -v bytes="$TV_MAX_BYTES" -v dur="$duration" 'BEGIN{printf "%.0f", (bytes*8)/dur}')"
+        ac3_kbps="${AC3_51_BR%k}"
+        aac_kbps="${AAC_STEREO_BR%k}"
+        if [[ "$ach" -ge 6 ]]; then
+          audio_total_kbps=$((ac3_kbps + aac_kbps))
+        else
+          audio_total_kbps=$((aac_kbps))
+        fi
+        audio_total_bps=$((audio_total_kbps * 1000))
+        video_bps="$(awk -v t="$target_bps" -v a="$audio_total_bps" 'BEGIN{v=t-a; if(v<100000) v=100000; printf "%.0f", v}')"
+        video_kbps=$(( (video_bps + 500) / 1000 ))
+        if [[ "$video_kbps" -lt 200 ]]; then
+          video_kbps=200
+        fi
+        VIDEO_BITRATE="${video_kbps}k"
+        echo "[SIZE ] TV episode detected — target max size: ${TV_MAX_BYTES} bytes; duration=${duration}s; video bitrate=${VIDEO_BITRATE}" >&2
+      else
+        echo "[WARN ] Could not parse duration for size calc; skipping size cap" >&2
+      fi
+    else
+      echo "[WARN ] No duration found; skipping size cap" >&2
+    fi
+  fi
+
+  if [[ "$subtitle_action" == "burn" ]]; then
+    echo "[CPU  ] Forced English subs -> burn-in (x264)" >&2
+    if [[ -n "$VIDEO_BITRATE" ]]; then
+      if "$FFMPEG" -y -stats \
+          "${TIMING_IN_FLAGS[@]}" \
+          -i "$src" \
+          "${TIMING_OUT_FLAGS[@]}" \
+          -map 0:v:0 \
+          "${audio_args[@]}" \
+          -vf "$vf_arg" \
+          -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
+          "${x264_extras[@]}" \
+          -movflags +faststart "$out"; then
+        encode_ok=1
+      fi
+    else
+      if "$FFMPEG" -y -stats \
+          "${TIMING_IN_FLAGS[@]}" \
+          -i "$src" \
+          "${TIMING_OUT_FLAGS[@]}" \
+          -map 0:v:0 \
+          "${audio_args[@]}" \
+          -vf "$vf_arg" \
+          -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
+          "${x264_extras[@]}" \
+          -movflags +faststart "$out"; then
+        encode_ok=1
+      fi
+    fi
+  else
+    echo "[QSV  ] No forced-English burn -> HEVC QSV" >&2
+    if [[ -n "$VIDEO_BITRATE" ]]; then
+      if "$FFMPEG" -y -stats \
+          "${TIMING_IN_FLAGS[@]}" \
+          -i "$src" \
+          "${TIMING_OUT_FLAGS[@]}" \
+          -map 0:v:0 \
+          "${audio_args[@]}" \
+          "${subtitle_args[@]}" \
+          -c:v hevc_qsv -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -preset "$QSV_PRESET" -tag:v hvc1 \
+          -movflags +faststart "$out"; then
+        encode_ok=1
+      else
+        echo "[WARN ] QSV failed -> CPU fallback (x264 with bitrate cap)" >&2
+        if "$FFMPEG" -y -stats \
+            "${TIMING_IN_FLAGS[@]}" \
+            -i "$src" \
+            "${TIMING_OUT_FLAGS[@]}" \
+            -map 0:v:0 \
+            "${audio_args[@]}" \
+            "${subtitle_args[@]}" \
+            -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
+            "${x264_extras[@]}" \
+            -movflags +faststart "$out"; then
+          encode_ok=1
+        fi
+      fi
+    else
+      if "$FFMPEG" -y -stats \
+          "${TIMING_IN_FLAGS[@]}" \
+          -i "$src" \
+          "${TIMING_OUT_FLAGS[@]}" \
+          -map 0:v:0 \
+          "${audio_args[@]}" \
+          "${subtitle_args[@]}" \
+          -c:v hevc_qsv -global_quality "$QSV_GLOBAL_QUALITY" -preset "$QSV_PRESET" -tag:v hvc1 \
+          -movflags +faststart "$out"; then
+        encode_ok=1
+      else
+        echo "[WARN ] QSV failed -> CPU fallback (x264)" >&2
+        if "$FFMPEG" -y -stats \
+            "${TIMING_IN_FLAGS[@]}" \
+            -i "$src" \
+            "${TIMING_OUT_FLAGS[@]}" \
+            -map 0:v:0 \
+            "${audio_args[@]}" \
+            "${subtitle_args[@]}" \
+            -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
+            "${x264_extras[@]}" \
+            -movflags +faststart "$out"; then
+          encode_ok=1
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "$encode_ok" -ne 1 ]]; then
+    rm -f "$out"
+    return 10
+  fi
+
+  if [[ "$subtitle_action" == "extract" ]]; then
+    extract_forced_eng_subtitle "$src" "$forced_eng_sub_pos" "$subtitle_codec" "$out" || \
+      echo "[WARN ] Failed to extract forced English subtitle sidecar" >&2
+  fi
+
+  if [[ "$detected_type" == "tv" && -n "$VIDEO_BITRATE" ]]; then
+    final_size="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+    if [[ -n "$final_size" && "$final_size" -gt "$TV_MAX_BYTES" ]]; then
+      echo "[WARN ] Final file exceeds ${TV_MAX_BYTES} bytes: ${final_size} bytes" >&2
+    fi
+  fi
+
+  return 0
+}
+
 copy_omdb_sidecar_for_output() {
   local prejson="$1"
   local outpath="$2"
@@ -765,12 +1113,13 @@ process_one() {
   local orig_base="${in%.*}"
   local repaired="${orig_base}.repaired.mkv"
   local out="${orig_base}.mp4"
+  local source_for_convert="$in"
+  local used_repaired=0
+  local convert_rc=0
 
   echo "[START] $in" >&2
 
   print_forced_sub_status "$in"
-
-  repair_mkv "$in" "$repaired" || { echo "[FAIL ] repair: $in" >&2; [[ "${VERBOSE:-0}" == "1" ]] && set +x; return 1; }
 
   if [[ -e "$out" ]]; then
     out="$(unique_path "$out")"
@@ -845,167 +1194,51 @@ process_one() {
 
   copy_omdb_sidecar_for_output "$prejson" "$out"
 
-  # Audio selection
-  local astream_idx acodec ach
-  astream_idx="$(pick_best_eng_audio_stream_index "$repaired")"
-  if [[ -z "$astream_idx" ]]; then
-    echo "[FAIL ] no English audio stream found: $in" >&2
-    rm -f "$repaired"
-    [[ "${VERBOSE:-0}" == "1" ]] && set +x
-    return 1
-  fi
-
-  IFS=',' read -r acodec ach <<< "$(get_audio_codec_and_channels "$repaired" "$astream_idx")"
-  mapfile -t audio_args < <(build_audio_args_with_stereo_fallback "$astream_idx" "$acodec" "$ach")
-  mapfile -t x264_extras < <(x264_extra_args)
-
-  echo "[AUDIO] primary=0:${astream_idx} codec=${acodec} ch=${ach} (stereo fallback if 5.1+)" >&2
-
-  # TV size cap: compute VIDEO_BITRATE if TV
-  local VIDEO_BITRATE=""
-  if [[ "$detected_type" == "tv" ]]; then
-    local duration
-    duration="$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$repaired" 2>/dev/null || echo "")"
-    if [[ -n "$duration" ]]; then
-      if awk "BEGIN{exit !($duration > 0)}"; then
-        local target_bps
-        target_bps="$(awk -v bytes="$TV_MAX_BYTES" -v dur="$duration" 'BEGIN{printf "%.0f", (bytes*8)/dur}')"
-        local ac3_kbps aac_kbps audio_total_kbps audio_total_bps
-        ac3_kbps="${AC3_51_BR%k}"
-        aac_kbps="${AAC_STEREO_BR%k}"
-        if [[ "$ach" -ge 6 ]]; then
-          audio_total_kbps=$(( (ac3_kbps + aac_kbps) ))
+  case "$REPAIR_MODE" in
+    always)
+      if ! repair_mkv "$in" "$repaired"; then
+        echo "[FAIL ] repair: $in" >&2
+        [[ "${VERBOSE:-0}" == "1" ]] && set +x
+        return 1
+      fi
+      source_for_convert="$repaired"
+      used_repaired=1
+      convert_from_source "$source_for_convert" "$out" "$detected_type" "$in"
+      convert_rc=$?
+      ;;
+    auto)
+      convert_from_source "$source_for_convert" "$out" "$detected_type" "$in"
+      convert_rc=$?
+      if [[ "$convert_rc" -eq 10 ]]; then
+        echo "[RETRY] Conversion failed; retrying with repaired MKV" >&2
+        if repair_mkv "$in" "$repaired"; then
+          source_for_convert="$repaired"
+          used_repaired=1
+          convert_from_source "$source_for_convert" "$out" "$detected_type" "$in"
+          convert_rc=$?
         else
-          audio_total_kbps=$(( aac_kbps ))
-        fi
-        audio_total_bps=$(( audio_total_kbps * 1000 ))
-        local video_bps
-        video_bps="$(awk -v t="$target_bps" -v a="$audio_total_bps" 'BEGIN{v=t-a; if(v<100000) v=100000; printf "%.0f", v}')"
-        local video_kbps
-        video_kbps=$(( (video_bps + 500) / 1000 ))
-        if [[ "$video_kbps" -lt 200 ]]; then
-          video_kbps=200
-        fi
-        VIDEO_BITRATE="${video_kbps}k"
-        echo "[SIZE ] TV episode detected — target max size: ${TV_MAX_BYTES} bytes; duration=${duration}s; video bitrate=${VIDEO_BITRATE}" >&2
-      else
-        echo "[WARN ] Could not parse duration for size calc; skipping size cap" >&2
-      fi
-    else
-      echo "[WARN ] No duration found; skipping size cap" >&2
-    fi
-  fi
-
-  # Encoding
-  local encode_ok=0
-  if has_forced_subs "$repaired"; then
-    local subpos subfile_esc vf_arg
-    subpos="$(pick_forced_sub_pos "$repaired")"
-    echo "[CPU  ] Forced subs → burn-in (x264)" >&2
-    subfile_esc="$(ffmpeg_subtitles_filter_escape "$repaired")"
-    if [[ -n "$subpos" ]]; then
-      vf_arg="subtitles='${subfile_esc}':si=$subpos"
-    else
-      vf_arg="subtitles='${subfile_esc}'"
-    fi
-
-    if [[ -n "$VIDEO_BITRATE" ]]; then
-      if "$FFMPEG" -y -stats \
-          "${TIMING_IN_FLAGS[@]}" \
-          -i "$repaired" \
-          "${TIMING_OUT_FLAGS[@]}" \
-          -map 0:v:0 \
-          "${audio_args[@]}" \
-          -vf "$vf_arg" \
-          -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
-          "${x264_extras[@]}" \
-          -movflags +faststart "$out"; then
-        encode_ok=1
-      fi
-    else
-      if "$FFMPEG" -y -stats \
-          "${TIMING_IN_FLAGS[@]}" \
-          -i "$repaired" \
-          "${TIMING_OUT_FLAGS[@]}" \
-          -map 0:v:0 \
-          "${audio_args[@]}" \
-          -vf "$vf_arg" \
-          -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
-          "${x264_extras[@]}" \
-          -movflags +faststart "$out"; then
-        encode_ok=1
-      fi
-    fi
-  else
-    echo "[QSV  ] No forced subs → HEVC QSV" >&2
-    if [[ -n "$VIDEO_BITRATE" ]]; then
-      if "$FFMPEG" -y -stats \
-          "${TIMING_IN_FLAGS[@]}" \
-          -i "$repaired" \
-          "${TIMING_OUT_FLAGS[@]}" \
-          -map 0:v:0 \
-          "${audio_args[@]}" \
-          -c:v hevc_qsv -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -preset "$QSV_PRESET" -tag:v hvc1 \
-          -movflags +faststart "$out"; then
-        encode_ok=1
-      else
-        echo "[WARN ] QSV failed → CPU fallback (x264 with bitrate cap)" >&2
-        if "$FFMPEG" -y -stats \
-            "${TIMING_IN_FLAGS[@]}" \
-            -i "$repaired" \
-            "${TIMING_OUT_FLAGS[@]}" \
-            -map 0:v:0 \
-            "${audio_args[@]}" \
-            -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
-            "${x264_extras[@]}" \
-            -movflags +faststart "$out"; then
-          encode_ok=1
+          echo "[FAIL ] repair: $in" >&2
         fi
       fi
-    else
-      if "$FFMPEG" -y -stats \
-          "${TIMING_IN_FLAGS[@]}" \
-          -i "$repaired" \
-          "${TIMING_OUT_FLAGS[@]}" \
-          -map 0:v:0 \
-          "${audio_args[@]}" \
-          -c:v hevc_qsv -global_quality "$QSV_GLOBAL_QUALITY" -preset "$QSV_PRESET" -tag:v hvc1 \
-          -movflags +faststart "$out"; then
-        encode_ok=1
-      else
-        echo "[WARN ] QSV failed → CPU fallback (x264)" >&2
-        if "$FFMPEG" -y -stats \
-            "${TIMING_IN_FLAGS[@]}" \
-            -i "$repaired" \
-            "${TIMING_OUT_FLAGS[@]}" \
-            -map 0:v:0 \
-            "${audio_args[@]}" \
-            -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
-            "${x264_extras[@]}" \
-            -movflags +faststart "$out"; then
-          encode_ok=1
-        fi
-      fi
-    fi
-  fi
+      ;;
+    never)
+      convert_from_source "$source_for_convert" "$out" "$detected_type" "$in"
+      convert_rc=$?
+      ;;
+  esac
 
-  rm -f "$repaired"
+  [[ "$used_repaired" == "1" ]] && rm -f "$repaired"
 
-  if [[ "$encode_ok" -ne 1 ]]; then
+  if [[ "$convert_rc" -ne 0 ]]; then
     rm -f "$out"
-    echo "[FAIL ] encode: $in" >&2
+    if [[ "$convert_rc" -ne 20 ]]; then
+      echo "[FAIL ] encode: $in" >&2
+    fi
     [[ "${VERBOSE:-0}" == "1" ]] && set +x
     return 1
   fi
 
   if [[ -s "$out" ]]; then
-    if [[ "$detected_type" == "tv" && -n "$VIDEO_BITRATE" ]]; then
-      local final_size
-      final_size=$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out" 2>/dev/null || echo 0)
-      if [[ -n "$final_size" && "$final_size" -gt "$TV_MAX_BYTES" ]]; then
-        echo "[WARN ] Final file exceeds ${TV_MAX_BYTES} bytes: ${final_size} bytes" >&2
-      fi
-    fi
     tag_plex_omdb_always "$out" || true
   fi
 

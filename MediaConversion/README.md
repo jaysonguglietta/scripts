@@ -4,10 +4,12 @@
 
 ## What it does
 
-- Repairs MKV inputs before encoding.
-- Preserves English audio, preferring the highest-channel track.
+- Keeps English audio only, preferring the highest-channel track.
 - Keeps a 5.1-compatible track when possible and adds an AAC stereo fallback.
-- Burns forced subtitles into the video when they exist.
+- Keeps only forced English subtitles and always drops non-English subtitles.
+- Supports `burn`, `copy`, and `extract` modes for forced English subtitles.
+- Uses a fast video-copy path for compatible H.264/HEVC sources when burn-in is not needed.
+- Retries with a repaired MKV only when needed in `REPAIR_MODE=auto`.
 - Uses Intel QSV HEVC when forced subtitle burn-in is not needed, with CPU fallback.
 - Looks up OMDb metadata, downloads poster art, and tags the finished MP4.
 - Renames output files from confirmed OMDb matches.
@@ -57,6 +59,9 @@ VERBOSE=0
 OMDB_API_KEY=your_key_here
 OMDB_INTERACTIVE=1
 TV_MAX_BYTES=1073741824
+REPAIR_MODE=auto
+SUBTITLE_MODE=burn
+FAST_VIDEO_COPY=1
 ```
 
 Example:
@@ -65,9 +70,16 @@ Example:
 OMDB_API_KEY=your_key_here JOBS=2 ./convert.sh
 ```
 
+Faster example that keeps forced English subtitles as sidecars instead of burning them:
+
+```bash
+OMDB_API_KEY=your_key_here REPAIR_MODE=auto SUBTITLE_MODE=extract JOBS=2 ./convert.sh
+```
+
 ## Notes
 
 - The script works on the current directory only.
 - Parallel OMDb log writes are synchronized when `flock` is available.
 - If a QSV encode fails, the script falls back to CPU x264 encoding.
-- Forced subtitle burn-in uses CPU encoding because subtitles are rendered into the video stream.
+- Forced English subtitle burn-in uses CPU encoding because subtitles are rendered into the video stream.
+- `SUBTITLE_MODE=copy` keeps only forced English text subtitles inside the MP4; image-based forced subtitles fall back to sidecar extraction.
