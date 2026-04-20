@@ -4,11 +4,24 @@ set -euo pipefail
 SCRIPT_NAME="$(basename "$0")"
 ORIGINAL_ARGS=("$@")
 DRY_RUN=0
+VERBOSE="${VERBOSE:-0}"
 CHECK_REBOOT=1
 CUSTOM_LOG_DIR="${LOG_DIR:-}"
 PACKAGE_MANAGER=""
 PACKAGE_FAMILY=""
 LOG_FILE=""
+START_TIME_EPOCH=0
+
+normalize_verbose() {
+  case "${VERBOSE}" in
+    ""|0|false|FALSE|no|NO|off|OFF)
+      VERBOSE=0
+      ;;
+    *)
+      VERBOSE=1
+      ;;
+  esac
+}
 
 usage() {
   cat <<EOF
@@ -18,6 +31,7 @@ Safely update a Fedora or Debian-family server.
 
 Options:
   -n, --dry-run         Preview package actions without applying them.
+  -v, --verbose         Show system details and pending update information.
   --log-dir DIR         Write logs to DIR.
   --no-reboot-check     Skip reboot-required detection.
   -h, --help            Show this help text.
@@ -98,8 +112,100 @@ detect_package_manager() {
   die "No supported package manager found. Expected dnf5, dnf, or apt-get."
 }
 
+show_system_overview() {
+  local package_tool_version=""
+  local uptime_text=""
+
+  printf '\n'
+  log "System overview"
+  log "Hostname: $(hostname)"
+
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    log "OS: ${PRETTY_NAME:-unknown}"
+  fi
+
+  log "Kernel: $(uname -r)"
+
+  if command -v uptime >/dev/null 2>&1; then
+    uptime_text="$(uptime -p 2>/dev/null || uptime)"
+    log "Uptime: $uptime_text"
+  fi
+
+  package_tool_version="$("$PACKAGE_MANAGER" --version 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$package_tool_version" ]]; then
+    log "Package tool: $package_tool_version"
+  fi
+}
+
+show_disk_usage() {
+  local label="$1"
+  local -a paths=("/")
+
+  if ! command -v df >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -d /boot ]]; then
+    paths+=("/boot")
+  fi
+
+  printf '\n'
+  log "$label"
+  df -h "${paths[@]}" 2>/dev/null | awk 'NR == 1 || !seen[$NF]++' | sed 's/^/  /'
+}
+
+show_available_updates() {
+  local rc=0
+
+  printf '\n'
+  log "Listing available updates"
+
+  case "$PACKAGE_FAMILY" in
+    dnf)
+      set +e
+      "$PACKAGE_MANAGER" check-update
+      rc=$?
+      set -e
+      case "$rc" in
+        0) log "No pending updates reported." ;;
+        100) log "Update list displayed above." ;;
+        *) log "Could not list updates (exit code $rc)." ;;
+      esac
+      ;;
+    apt)
+      if command -v apt >/dev/null 2>&1; then
+        set +e
+        apt list --upgradable 2>/dev/null
+        rc=$?
+        set -e
+        if [[ "$rc" -ne 0 ]]; then
+          log "Could not list upgradable packages with apt."
+        fi
+      else
+        set +e
+        apt-get -s full-upgrade
+        rc=$?
+        set -e
+        if [[ "$rc" -ne 0 ]]; then
+          log "Could not simulate full-upgrade to list pending packages."
+        fi
+      fi
+      ;;
+  esac
+}
+
+elapsed_seconds() {
+  printf '%s\n' "$(( $(date +%s) - START_TIME_EPOCH ))"
+}
+
 update_with_dnf() {
   local -a cmd_flags=(-y)
+
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    cmd_flags=(-v -y)
+  fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     cmd_flags+=(--assumeno)
@@ -118,18 +224,21 @@ update_with_dnf() {
 }
 
 update_with_apt() {
-  local -a simulate_flags=()
+  local -a cmd_flags=(-y)
 
-  run_cmd "Refreshing package metadata" apt-get update
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    simulate_flags+=(-s)
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    cmd_flags+=(-V)
   fi
 
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    cmd_flags+=(-s)
+  fi
+
+  run_cmd "Refreshing package metadata" apt-get update
   run_cmd "Applying available updates" \
-    apt-get "${simulate_flags[@]}" -y full-upgrade
+    apt-get "${cmd_flags[@]}" full-upgrade
   run_cmd "Removing unneeded packages" \
-    apt-get "${simulate_flags[@]}" -y --purge autoremove
+    apt-get "${cmd_flags[@]}" --purge autoremove
 
   if [[ "$DRY_RUN" -eq 0 ]]; then
     run_cmd "Cleaning package caches" apt-get clean
@@ -181,6 +290,9 @@ while [[ $# -gt 0 ]]; do
     -n|--dry-run)
       DRY_RUN=1
       ;;
+    -v|--verbose)
+      VERBOSE=1
+      ;;
     --log-dir)
       shift
       [[ $# -gt 0 ]] || die "--log-dir requires a directory path."
@@ -201,13 +313,16 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+normalize_verbose
+
 if [[ "${EUID}" -ne 0 ]]; then
   command -v sudo >/dev/null 2>&1 || die "sudo is required when running as a non-root user."
-  exec sudo --preserve-env=LOG_DIR "$0" "${ORIGINAL_ARGS[@]}"
+  exec sudo --preserve-env=LOG_DIR,VERBOSE "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
 setup_logging
-trap 'rc=$?; if [[ $rc -eq 0 ]]; then log "Update run finished successfully."; else log "Update run failed with exit code $rc."; fi; if [[ -n "${LOG_FILE:-}" ]]; then log "Log saved to $LOG_FILE"; fi' EXIT
+START_TIME_EPOCH="$(date +%s)"
+trap 'rc=$?; duration="$(elapsed_seconds)"; if [[ $rc -eq 0 ]]; then log "Update run finished successfully."; else log "Update run failed with exit code $rc."; fi; log "Elapsed time: ${duration}s"; if [[ -n "${LOG_FILE:-}" ]]; then log "Log saved to $LOG_FILE"; fi' EXIT
 trap 'log "Update run interrupted."; exit 130' INT TERM
 
 detect_package_manager
@@ -219,7 +334,18 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 else
   log "Mode: apply changes"
 fi
+if [[ "$VERBOSE" -eq 1 ]]; then
+  log "Verbose mode: enabled"
+else
+  log "Verbose mode: disabled"
+fi
 log "Log file: $LOG_FILE"
+
+if [[ "$VERBOSE" -eq 1 ]]; then
+  show_system_overview
+  show_disk_usage "Disk usage before updates"
+  show_available_updates
+fi
 
 case "$PACKAGE_FAMILY" in
   dnf)
@@ -234,3 +360,7 @@ case "$PACKAGE_FAMILY" in
 esac
 
 check_reboot_status
+
+if [[ "$VERBOSE" -eq 1 ]]; then
+  show_disk_usage "Disk usage after updates"
+fi
