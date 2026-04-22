@@ -13,6 +13,7 @@
 # - Enhanced year detection for movies and SxxExx detection for TV
 # - Hard-stop on Ctrl-C (kills all background jobs)
 # - TV episodes: try to keep encoded MP4 <= 1 GiB (best-effort)
+# - Reserve MP4 metadata headroom so MetaFetch can tag converted files in place
 # - Interactive OMDb verification and ability to select alternatives
 # - Automatically rename output MP4s based on confirmed OMDb metadata
 #
@@ -59,7 +60,8 @@ Usage:
   ./convert.sh --print-subs-only     # scan current dir for MKV and report forced English subtitles
 Environment overrides:
   FFMPEG, FFPROBE, JOBS, VERBOSE, OMDB_API_KEY, OMDB_INTERACTIVE,
-  REPAIR_MODE=auto|always|never, SUBTITLE_MODE=burn|copy|extract, FAST_VIDEO_COPY=0|1, ...
+  REPAIR_MODE=auto|always|never, SUBTITLE_MODE=burn|copy|extract,
+  FAST_VIDEO_COPY=0|1, MP4_TAG_HEADROOM_BYTES=16777216, ...
 EOF
   exit 0
 fi
@@ -95,6 +97,7 @@ VBV_BUFSIZE="${VBV_BUFSIZE:-30000}"
 AAC_STEREO_BR="${AAC_STEREO_BR:-192k}"
 AC3_51_BR="${AC3_51_BR:-640k}"
 TV_MAX_BYTES="${TV_MAX_BYTES:-1073741824}"  # 1 GiB default
+MP4_TAG_HEADROOM_BYTES="${MP4_TAG_HEADROOM_BYTES:-16777216}"  # 16 MiB reserved for later MetaFetch tags
 
 TIMING_IN_FLAGS=()
 TIMING_OUT_FLAGS=()
@@ -127,6 +130,22 @@ case "$FAST_VIDEO_COPY" in
     ;;
 esac
 
+case "$MP4_TAG_HEADROOM_BYTES" in
+  ''|*[!0-9]*)
+    echo "[ERROR] Invalid MP4_TAG_HEADROOM_BYTES: ${MP4_TAG_HEADROOM_BYTES} (expected non-negative integer bytes)" >&2
+    exit 1
+    ;;
+esac
+
+MP4_OUTPUT_FLAGS=()
+if (( MP4_TAG_HEADROOM_BYTES > 0 )); then
+  # -moov_size writes the MP4 movie header at the front and leaves free space after it.
+  # MetaFetch can then grow title/artwork atoms later without rewriting the full media payload.
+  MP4_OUTPUT_FLAGS=(-moov_size "$MP4_TAG_HEADROOM_BYTES")
+else
+  MP4_OUTPUT_FLAGS=(-movflags +faststart)
+fi
+
 ############################################
 # Hard-stop on Ctrl-C: kill entire process group
 ############################################
@@ -143,6 +162,7 @@ echo "Found ${#FILES[@]} MKV file(s) in $(pwd)" >&2
 echo "Parallel jobs: ${JOBS}  OMDb interactive: ${OMDB_INTERACTIVE}  VERBOSE: ${VERBOSE}" >&2
 echo "Repair mode: ${REPAIR_MODE}  Subtitle mode: ${SUBTITLE_MODE}  Fast video copy: ${FAST_VIDEO_COPY}" >&2
 echo "TV max bytes: ${TV_MAX_BYTES}" >&2
+echo "MP4 tag headroom: ${MP4_TAG_HEADROOM_BYTES} bytes" >&2
 echo "========================================" >&2
 
 [[ ${#FILES[@]} -eq 0 ]] && { echo "[INFO] No MKV files found; exiting." >&2; exit 0; }
@@ -618,6 +638,14 @@ file_size_bytes() {
   stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null
 }
 
+tv_payload_budget_bytes() {
+  local budget="$TV_MAX_BYTES"
+  if (( MP4_TAG_HEADROOM_BYTES > 0 && budget > MP4_TAG_HEADROOM_BYTES )); then
+    budget=$((budget - MP4_TAG_HEADROOM_BYTES))
+  fi
+  printf "%s" "$budget"
+}
+
 can_use_fast_video_copy() {
   local file="$1" detected_type="$2" video_codec="$3" subtitle_action="$4"
   [[ "$FAST_VIDEO_COPY" == "1" ]] || return 1
@@ -625,10 +653,11 @@ can_use_fast_video_copy() {
   video_codec_can_copy_to_mp4 "$video_codec" || return 1
 
   if [[ "$detected_type" == "tv" ]]; then
-    local source_size
+    local source_size source_budget
     source_size="$(file_size_bytes "$file" 2>/dev/null || true)"
+    source_budget="$(tv_payload_budget_bytes)"
     [[ -n "$source_size" ]] || return 1
-    [[ "$source_size" -le "$TV_MAX_BYTES" ]] || return 1
+    [[ "$source_size" -le "$source_budget" ]] || return 1
   fi
 
   return 0
@@ -752,7 +781,7 @@ convert_from_source() {
         "${audio_args[@]}" \
         "${subtitle_args[@]}" \
         "${video_copy_args[@]}" \
-        -movflags +faststart "$out"; then
+        "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
       if [[ "$subtitle_action" == "extract" ]]; then
         extract_forced_eng_subtitle "$src" "$forced_eng_sub_pos" "$subtitle_codec" "$out" || \
           echo "[WARN ] Failed to extract forced English subtitle sidecar" >&2
@@ -768,7 +797,9 @@ convert_from_source() {
     duration="$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$src" 2>/dev/null || echo "")"
     if [[ -n "$duration" ]]; then
       if awk "BEGIN{exit !($duration > 0)}"; then
-        target_bps="$(awk -v bytes="$TV_MAX_BYTES" -v dur="$duration" 'BEGIN{printf "%.0f", (bytes*8)/dur}')"
+        local target_payload_bytes
+        target_payload_bytes="$(tv_payload_budget_bytes)"
+        target_bps="$(awk -v bytes="$target_payload_bytes" -v dur="$duration" 'BEGIN{printf "%.0f", (bytes*8)/dur}')"
         ac3_kbps="${AC3_51_BR%k}"
         aac_kbps="${AAC_STEREO_BR%k}"
         if [[ "$ach" -ge 6 ]]; then
@@ -783,7 +814,7 @@ convert_from_source() {
           video_kbps=200
         fi
         VIDEO_BITRATE="${video_kbps}k"
-        echo "[SIZE ] TV episode detected — target max size: ${TV_MAX_BYTES} bytes; duration=${duration}s; video bitrate=${VIDEO_BITRATE}" >&2
+        echo "[SIZE ] TV episode detected — target max size: ${TV_MAX_BYTES} bytes; tag headroom=${MP4_TAG_HEADROOM_BYTES}; media budget=${target_payload_bytes}; duration=${duration}s; video bitrate=${VIDEO_BITRATE}" >&2
       else
         echo "[WARN ] Could not parse duration for size calc; skipping size cap" >&2
       fi
@@ -804,7 +835,7 @@ convert_from_source() {
           -vf "$vf_arg" \
           -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
           "${x264_extras[@]}" \
-          -movflags +faststart "$out"; then
+          "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
         encode_ok=1
       fi
     else
@@ -817,7 +848,7 @@ convert_from_source() {
           -vf "$vf_arg" \
           -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
           "${x264_extras[@]}" \
-          -movflags +faststart "$out"; then
+          "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
         encode_ok=1
       fi
     fi
@@ -832,7 +863,7 @@ convert_from_source() {
           "${audio_args[@]}" \
           "${subtitle_args[@]}" \
           -c:v hevc_qsv -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -preset "$QSV_PRESET" -tag:v hvc1 \
-          -movflags +faststart "$out"; then
+          "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
         encode_ok=1
       else
         echo "[WARN ] QSV failed -> CPU fallback (x264 with bitrate cap)" >&2
@@ -845,7 +876,7 @@ convert_from_source() {
             "${subtitle_args[@]}" \
             -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
             "${x264_extras[@]}" \
-            -movflags +faststart "$out"; then
+            "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
           encode_ok=1
         fi
       fi
@@ -858,7 +889,7 @@ convert_from_source() {
           "${audio_args[@]}" \
           "${subtitle_args[@]}" \
           -c:v hevc_qsv -global_quality "$QSV_GLOBAL_QUALITY" -preset "$QSV_PRESET" -tag:v hvc1 \
-          -movflags +faststart "$out"; then
+          "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
         encode_ok=1
       else
         echo "[WARN ] QSV failed -> CPU fallback (x264)" >&2
@@ -871,7 +902,7 @@ convert_from_source() {
             "${subtitle_args[@]}" \
             -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
             "${x264_extras[@]}" \
-            -movflags +faststart "$out"; then
+            "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
           encode_ok=1
         fi
       fi
@@ -967,7 +998,7 @@ ffmpeg_embed_cover_and_basic_tags() {
     -metadata title="$title" \
     -metadata comment="$desc" \
     -metadata date="$year" \
-    -movflags +faststart \
+    "${MP4_OUTPUT_FLAGS[@]}" \
     "$tmp" && mv -f "$tmp" "$mp4"
 }
 
