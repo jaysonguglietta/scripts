@@ -310,6 +310,22 @@ omdb_fetch_by_id() {
   omdb_api_request "i=${imdbid}"
 }
 
+omdb_prompt_read() {
+  local prompt="$1" varname="$2"
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt" "$varname"
+    return $?
+  fi
+
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    printf "%s" "$prompt" > /dev/tty
+    IFS= read -r "$varname" < /dev/tty
+    return $?
+  fi
+
+  return 1
+}
+
 # Interactive verification and save chosen JSON to <inputbase>.omdb.json
 omdb_interactive_verify_and_save() {
   local filepath="$1"
@@ -317,11 +333,13 @@ omdb_interactive_verify_and_save() {
   local outjson="${filepath%.*}.omdb.json"
 
   if [[ "${OMDB_INTERACTIVE:-1}" != "1" ]]; then
+    echo "[OMDb] interactive verification disabled; using automatic lookup for ${filepath}" >&2
     omdb_lookup "$base" > "$outjson" 2>/dev/null || echo "{}" > "$outjson"
     return 0
   fi
 
-  if [[ ! -t 0 ]]; then
+  if [[ ! -t 0 && ! -r /dev/tty ]]; then
+    echo "[OMDb] no interactive terminal available; using automatic lookup for ${filepath}" >&2
     omdb_lookup "$base" > "$outjson" 2>/dev/null || echo "{}" > "$outjson"
     return 0
   fi
@@ -346,7 +364,11 @@ omdb_interactive_verify_and_save() {
     fi
     echo
     while true; do
-      read -r -p "Is this match correct? (y)es / (n)o / (s)earch alternatives / (k)skip: " ans
+      if ! omdb_prompt_read "Is this match correct? (y)es / (n)o / (s)earch alternatives / (k)skip: " ans; then
+        echo "[OMDb] prompt unavailable; saving automatic match for ${filepath}" >&2
+        printf "%s" "$json" > "$outjson"
+        return 0
+      fi
       case "${ans,,}" in
         y|yes)
           printf "%s" "$json" > "$outjson"
@@ -397,7 +419,15 @@ omdb_interactive_verify_and_save() {
 
   local choice
   while true; do
-    read -r -p "Choice [0-8]: " choice
+    if ! omdb_prompt_read "Choice [0-8]: " choice; then
+      echo "[OMDb] prompt unavailable; keeping original/no selection for ${filepath}" >&2
+      if [[ -n "$json" ]]; then
+        printf "%s" "$json" > "$outjson"
+      else
+        echo "{}" > "$outjson"
+      fi
+      return 0
+    fi
     if [[ "$choice" =~ ^[0-9]+$ ]]; then
       if [[ "$choice" -eq 0 ]]; then
         if [[ -n "$json" ]]; then
@@ -1095,6 +1125,7 @@ for f in "${FILES[@]}"; do
   if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
     omdb_interactive_verify_and_save "$f"
   else
+    echo "[OMDb] curl or jq missing; skipping interactive metadata lookup for ${f}" >&2
     echo "{}" > "${f%.*}.omdb.json"
   fi
 done
