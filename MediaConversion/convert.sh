@@ -707,6 +707,16 @@ extract_forced_eng_subtitle() {
   fi
 }
 
+log_has_non_monotonic_dts() {
+  local log_file="$1"
+  [[ -f "$log_file" ]] || return 1
+  if command -v rg >/dev/null 2>&1; then
+    rg -q 'Non-monotonic DTS' "$log_file"
+  else
+    grep -q 'Non-monotonic DTS' "$log_file"
+  fi
+}
+
 convert_from_source() {
   local src="$1" out="$2" detected_type="$3" original_in="$4"
   local astream_idx acodec ach video_codec
@@ -714,6 +724,7 @@ convert_from_source() {
   local VIDEO_BITRATE="" encode_ok=0
   local -a audio_args=() x264_extras=() subtitle_args=() video_copy_args=()
   local subfile_esc vf_arg duration target_bps ac3_kbps aac_kbps audio_total_kbps audio_total_bps video_bps video_kbps final_size
+  local fast_copy_log="" fast_copy_had_dts=0
 
   astream_idx="$(pick_best_eng_audio_stream_index "$src")"
   if [[ -z "$astream_idx" ]]; then
@@ -773,15 +784,37 @@ convert_from_source() {
     video_copy_args=(-c:v copy)
     [[ "$video_codec" == "hevc" ]] && video_copy_args+=(-tag:v hvc1)
 
-    if "$FFMPEG" -y -stats \
+    fast_copy_log="$(mktemp /tmp/convert-fast-copy.XXXXXX.log 2>/dev/null || true)"
+    if [[ -n "$fast_copy_log" ]]; then
+      if "$FFMPEG" -y -stats \
+          "${TIMING_IN_FLAGS[@]}" \
+          -i "$src" \
+          "${TIMING_OUT_FLAGS[@]}" \
+          -map 0:v:0 \
+          -copytb 1 \
+          "${audio_args[@]}" \
+          "${subtitle_args[@]}" \
+          "${video_copy_args[@]}" \
+          "${MP4_OUTPUT_FLAGS[@]}" "$out" 2> >(tee "$fast_copy_log" >&2); then
+        if log_has_non_monotonic_dts "$fast_copy_log"; then
+          fast_copy_had_dts=1
+        fi
+      fi
+      rm -f "$fast_copy_log"
+    elif "$FFMPEG" -y -stats \
         "${TIMING_IN_FLAGS[@]}" \
         -i "$src" \
         "${TIMING_OUT_FLAGS[@]}" \
         -map 0:v:0 \
+        -copytb 1 \
         "${audio_args[@]}" \
         "${subtitle_args[@]}" \
         "${video_copy_args[@]}" \
         "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
+      fast_copy_had_dts=0
+    fi
+
+    if [[ -s "$out" && "$fast_copy_had_dts" -eq 0 ]]; then
       if [[ "$subtitle_action" == "extract" ]]; then
         extract_forced_eng_subtitle "$src" "$forced_eng_sub_pos" "$subtitle_codec" "$out" || \
           echo "[WARN ] Failed to extract forced English subtitle sidecar" >&2
@@ -790,7 +823,15 @@ convert_from_source() {
     fi
 
     rm -f "$out"
-    echo "[WARN ] Fast video copy failed; falling back to encode path" >&2
+    if [[ "$fast_copy_had_dts" -eq 1 ]]; then
+      if [[ "$REPAIR_MODE" != "never" && "$src" == "$original_in" ]]; then
+        echo "[WARN ] Fast video copy produced non-monotonic DTS; retrying with repaired MKV" >&2
+        return 11
+      fi
+      echo "[WARN ] Fast video copy produced non-monotonic DTS; falling back to encode path" >&2
+    else
+      echo "[WARN ] Fast video copy failed; falling back to encode path" >&2
+    fi
   fi
 
   if [[ "$detected_type" == "tv" ]]; then
@@ -1271,8 +1312,12 @@ process_one() {
     auto)
       convert_from_source "$source_for_convert" "$out" "$detected_type" "$in"
       convert_rc=$?
-      if [[ "$convert_rc" -eq 10 ]]; then
-        echo "[RETRY] Conversion failed; retrying with repaired MKV" >&2
+      if [[ "$convert_rc" -eq 10 || "$convert_rc" -eq 11 ]]; then
+        if [[ "$convert_rc" -eq 11 ]]; then
+          echo "[RETRY] Fast copy hit non-monotonic DTS; retrying with repaired MKV" >&2
+        else
+          echo "[RETRY] Conversion failed; retrying with repaired MKV" >&2
+        fi
         if repair_mkv "$in" "$repaired"; then
           source_for_convert="$repaired"
           used_repaired=1
