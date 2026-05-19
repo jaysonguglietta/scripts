@@ -3,7 +3,7 @@
 #
 # MKV -> MP4 (Plex on Apple TV 4K optimized)
 # - Automatic MKV repair retry in auto mode (mkvmerge preferred, ffmpeg copy fallback)
-# - Keep English audio only (prefer highest-channel English); keep 5.1 when possible + add AAC stereo fallback
+# - Keep English audio only (prefer highest-channel English); optional fallback to an untagged default track; keep 5.1 when possible + add AAC stereo fallback
 # - Forced English subtitles only: burn/copy/extract modes; always drop non-English subtitles
 # - Fast path: copy compatible H.264/HEVC video into MP4 when burn-in is not needed
 # - Always do OMDb lookup (omdbapi.com)
@@ -44,6 +44,9 @@
 #   REPAIR_MODE=auto SUBTITLE_MODE=extract ./convert.sh
 #     - Retry with a repaired MKV only after a conversion failure; extract forced English subtitles as sidecars.
 #
+#   ALLOW_UNTAGGED_AUDIO_FALLBACK=1 ./convert.sh
+#     - If no audio track is tagged English, allow the default/untagged audio track to be used.
+#
 set -uo pipefail
 shopt -s nullglob
 
@@ -61,7 +64,8 @@ Usage:
 Environment overrides:
   FFMPEG, FFPROBE, JOBS, VERBOSE, OMDB_API_KEY, OMDB_INTERACTIVE,
   REPAIR_MODE=auto|always|never, SUBTITLE_MODE=burn|copy|extract,
-  FAST_VIDEO_COPY=0|1, MP4_TAG_HEADROOM_BYTES=16777216, ...
+  FAST_VIDEO_COPY=0|1, ALLOW_UNTAGGED_AUDIO_FALLBACK=0|1,
+  MP4_TAG_HEADROOM_BYTES=16777216, ...
 EOF
   exit 0
 fi
@@ -85,6 +89,7 @@ OMDB_INTERACTIVE="${OMDB_INTERACTIVE:-1}"
 REPAIR_MODE="${REPAIR_MODE:-auto}"      # auto|always|never
 SUBTITLE_MODE="${SUBTITLE_MODE:-burn}"  # burn|copy|extract
 FAST_VIDEO_COPY="${FAST_VIDEO_COPY:-1}" # 1 = copy compatible H.264/HEVC video when possible
+ALLOW_UNTAGGED_AUDIO_FALLBACK="${ALLOW_UNTAGGED_AUDIO_FALLBACK:-1}" # 1 = use default/untagged audio if no English tag exists
 FIX_TIMESTAMPS="${FIX_TIMESTAMPS:-1}"
 QSV_GLOBAL_QUALITY="${QSV_GLOBAL_QUALITY:-22}"
 QSV_PRESET="${QSV_PRESET:-medium}"
@@ -130,6 +135,14 @@ case "$FAST_VIDEO_COPY" in
     ;;
 esac
 
+case "$ALLOW_UNTAGGED_AUDIO_FALLBACK" in
+  0|1) ;;
+  *)
+    echo "[ERROR] Invalid ALLOW_UNTAGGED_AUDIO_FALLBACK: ${ALLOW_UNTAGGED_AUDIO_FALLBACK} (expected 0 or 1)" >&2
+    exit 1
+    ;;
+esac
+
 case "$MP4_TAG_HEADROOM_BYTES" in
   ''|*[!0-9]*)
     echo "[ERROR] Invalid MP4_TAG_HEADROOM_BYTES: ${MP4_TAG_HEADROOM_BYTES} (expected non-negative integer bytes)" >&2
@@ -161,6 +174,7 @@ echo "convert.sh — MKV → MP4 batch converter" >&2
 echo "Found ${#FILES[@]} MKV file(s) in $(pwd)" >&2
 echo "Parallel jobs: ${JOBS}  OMDb interactive: ${OMDB_INTERACTIVE}  VERBOSE: ${VERBOSE}" >&2
 echo "Repair mode: ${REPAIR_MODE}  Subtitle mode: ${SUBTITLE_MODE}  Fast video copy: ${FAST_VIDEO_COPY}" >&2
+echo "Allow untagged audio fallback: ${ALLOW_UNTAGGED_AUDIO_FALLBACK}" >&2
 echo "TV max bytes: ${TV_MAX_BYTES}" >&2
 echo "MP4 tag headroom: ${MP4_TAG_HEADROOM_BYTES} bytes" >&2
 echo "========================================" >&2
@@ -554,11 +568,59 @@ pick_best_eng_audio_stream_index() {
       BEGIN { best_idx=""; best_ch=-1 }
       {
         idx=$1; codec=$2; ch=$3; lang=tolower($4);
-        if (lang=="eng") {
+        if (lang=="eng" || lang=="en" || lang=="english" || lang ~ /^eng[-_]/ || lang ~ /^en[-_]/) {
           if (ch+0 > best_ch) { best_ch=ch+0; best_idx=idx; }
         }
       }
       END { if (best_idx!="") print best_idx }'
+}
+
+pick_best_untagged_audio_stream_index() {
+  "$FFPROBE" -v error -select_streams a \
+    -show_entries stream=index,channels:stream_disposition=default:stream_tags=language \
+    -of csv=p=0 "$1" | awk -F',' '
+      BEGIN { best_default_idx=""; best_default_ch=-1; best_blank_idx=""; best_blank_ch=-1 }
+      {
+        idx=$1; ch=$2+0; def=$3+0; lang=tolower($4);
+        if (lang=="") {
+          if (def==1 && ch > best_default_ch) { best_default_ch=ch; best_default_idx=idx; }
+          if (ch > best_blank_ch) { best_blank_ch=ch; best_blank_idx=idx; }
+        }
+      }
+      END {
+        if (best_default_idx!="") print best_default_idx;
+        else if (best_blank_idx!="") print best_blank_idx;
+      }'
+}
+
+pick_audio_stream_index() {
+  local file="$1"
+  local eng_idx=""
+  eng_idx="$(pick_best_eng_audio_stream_index "$file")"
+  if [[ -n "$eng_idx" ]]; then
+    printf "%s|english" "$eng_idx"
+    return 0
+  fi
+
+  if [[ "$ALLOW_UNTAGGED_AUDIO_FALLBACK" == "1" ]]; then
+    local fallback_idx=""
+    fallback_idx="$(pick_best_untagged_audio_stream_index "$file")"
+    if [[ -n "$fallback_idx" ]]; then
+      printf "%s|untagged" "$fallback_idx"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+get_audio_stream_language() {
+  local file="$1" stream_index="$2"
+  "$FFPROBE" -v error \
+    -select_streams a \
+    -show_entries stream=index:stream_tags=language \
+    -of csv=p=0 "$file" | awk -F',' -v idx="$stream_index" '
+      $1==idx { print tolower($2); exit }'
 }
 
 get_audio_codec_and_channels() {
@@ -719,25 +781,34 @@ log_has_non_monotonic_dts() {
 
 convert_from_source() {
   local src="$1" out="$2" detected_type="$3" original_in="$4"
-  local astream_idx acodec ach video_codec
+  local astream_idx acodec ach video_codec selected_audio_kind audio_lang
   local forced_eng_sub_pos="" subtitle_codec="" subtitle_action="none"
   local VIDEO_BITRATE="" encode_ok=0
   local -a audio_args=() x264_extras=() subtitle_args=() video_copy_args=()
   local subfile_esc vf_arg duration target_bps ac3_kbps aac_kbps audio_total_kbps audio_total_bps video_bps video_kbps final_size
   local fast_copy_log="" fast_copy_had_dts=0
 
-  astream_idx="$(pick_best_eng_audio_stream_index "$src")"
+  IFS='|' read -r astream_idx selected_audio_kind <<< "$(pick_audio_stream_index "$src" || true)"
   if [[ -z "$astream_idx" ]]; then
-    echo "[FAIL ] no English audio stream found: $original_in" >&2
+    echo "[FAIL ] no English audio stream found and no untagged fallback was eligible: $original_in" >&2
     return 20
   fi
 
   IFS=',' read -r acodec ach <<< "$(get_audio_codec_and_channels "$src" "$astream_idx")"
+  audio_lang="$(get_audio_stream_language "$src" "$astream_idx" || true)"
   mapfile -t audio_args < <(build_audio_args_with_stereo_fallback "$astream_idx" "$acodec" "$ach")
   mapfile -t x264_extras < <(x264_extra_args)
   video_codec="$(get_video_codec_name "$src")"
 
-  echo "[AUDIO] primary=0:${astream_idx} codec=${acodec} ch=${ach} (English only; stereo fallback if 5.1+)" >&2
+  if [[ "$selected_audio_kind" == "untagged" ]]; then
+    echo "[WARN ] No audio track was tagged English; using untagged/default audio stream 0:${astream_idx}" >&2
+  fi
+
+  if [[ -n "$audio_lang" ]]; then
+    echo "[AUDIO] primary=0:${astream_idx} codec=${acodec} ch=${ach} lang=${audio_lang} (English only; stereo fallback if 5.1+)" >&2
+  else
+    echo "[AUDIO] primary=0:${astream_idx} codec=${acodec} ch=${ach} lang=untagged (English only; stereo fallback if 5.1+)" >&2
+  fi
   [[ -n "$video_codec" ]] && echo "[VIDEO] source codec=${video_codec}" >&2
 
   forced_eng_sub_pos="$(pick_forced_eng_sub_pos "$src" || true)"
