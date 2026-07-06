@@ -12,7 +12,9 @@
 # - Graceful fallbacks if OMDb doesn't match or tools missing
 # - Enhanced year detection for movies and SxxExx detection for TV
 # - Hard-stop on Ctrl-C (kills all background jobs)
-# - TV episodes: try to keep encoded MP4 <= 1 GiB (best-effort)
+# - TV episodes: try to keep encoded MP4 <= 1 GiB by default (best-effort)
+# - Optional --target-size SIZE cap for any file, e.g. --target-size 2GB
+# - Optional quality controls for tight size targets: --max-height, --audio, --quality-encode
 # - Reserve MP4 metadata headroom so MetaFetch can tag converted files in place
 # - Interactive OMDb verification and ability to select alternatives
 # - Automatically rename output MP4s based on confirmed OMDb metadata
@@ -25,6 +27,13 @@
 #     - Scan all *.mkv in the current directory and print:
 #         <file>: Forced English Subtitles = True|False
 #       Then exit (no conversion, no OMDb lookups).
+#
+#   ./convert.sh --target-size 2GB
+#     - Aim to keep each output MP4 under ~2 GiB (best-effort bitrate cap).
+#
+#   ./convert.sh --target-size 2GB --max-height 720 --audio stereo --quality-encode
+#     - Better quality when shrinking large sources to a small file: downscale,
+#       spend less on audio, and use slower software HEVC instead of fast QSV.
 #
 #   ./convert.sh -h
 #     - Show brief help.
@@ -54,25 +63,136 @@ shopt -s nullglob
 ############################################
 # CLI args
 #   --print-subs-only : scan files and print forced English subtitle presence, then exit
+#   --target-size SIZE: best-effort output size cap for any file
+#   --max-height N    : downscale video to at most N pixels high
+#   --audio MODE     : surround+stereo|surround|stereo
+#   --quality-encode : use slower software HEVC for better compression quality
 ############################################
 MODE="convert"
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+TARGET_SIZE_SPEC=""
+MAX_HEIGHT_CLI=""
+AUDIO_MODE_CLI=""
+QUALITY_ENCODE_CLI=""
+
+print_usage() {
   cat >&2 <<'EOF'
 Usage:
-  ./convert.sh                       # normal convert mode
-  ./convert.sh --print-subs-only     # scan current dir for MKV and report forced English subtitles
+  ./convert.sh [options]
+
+Options:
+  --target-size SIZE        best-effort output size cap for any file, e.g. 2GB or 700MB
+  --max-height HEIGHT       downscale video to at most HEIGHT pixels high, e.g. 720
+  --audio MODE              surround+stereo, surround, or stereo
+  --quality-encode          use slower software HEVC for better quality at small sizes
+  --print-subs-only         scan current dir for MKV and report forced English subtitles
+  -h, --help                show this help
+
 Environment overrides:
   FFMPEG, FFPROBE, JOBS, VERBOSE, OMDB_API_KEY, OMDB_INTERACTIVE,
   REPAIR_MODE=auto|always|never, SUBTITLE_MODE=burn|copy|extract,
   FAST_VIDEO_COPY=0|1, ALLOW_UNTAGGED_AUDIO_FALLBACK=0|1,
-  MP4_TAG_HEADROOM_BYTES=16777216, ...
+  AUDIO_MODE=surround+stereo|surround|stereo, QUALITY_ENCODE=0|1,
+  MAX_HEIGHT=0, TV_MAX_BYTES=1073741824, MP4_TAG_HEADROOM_BYTES=16777216, ...
 EOF
-  exit 0
-fi
-if [[ "${1:-}" == "--print-subs-only" ]]; then
-  MODE="subs_only"
-  shift || true
-fi
+}
+
+parse_size_to_bytes() {
+  local raw="${1:-}" cleaned number unit multiplier
+  cleaned="$(printf "%s" "$raw" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+
+  if [[ ! "$cleaned" =~ ^([0-9]+([.][0-9]+)?)(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB)?$ ]]; then
+    return 1
+  fi
+
+  number="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[3]:-B}"
+  case "$unit" in
+    B) multiplier=1 ;;
+    K|KB|KIB) multiplier=1024 ;;
+    M|MB|MIB) multiplier=$((1024 * 1024)) ;;
+    G|GB|GIB) multiplier=$((1024 * 1024 * 1024)) ;;
+    T|TB|TIB) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+    *) return 1 ;;
+  esac
+
+  awk -v number="$number" -v multiplier="$multiplier" '
+    BEGIN {
+      bytes = number * multiplier
+      if (bytes < 1) exit 1
+      printf "%.0f\n", bytes
+    }
+  '
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)
+      print_usage
+      exit 0
+      ;;
+    --print-subs-only)
+      MODE="subs_only"
+      shift
+      ;;
+    --target-size)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "[ERROR] --target-size requires a value, e.g. --target-size 2GB" >&2
+        exit 1
+      fi
+      TARGET_SIZE_SPEC="$2"
+      shift 2
+      ;;
+    --target-size=*)
+      TARGET_SIZE_SPEC="${1#*=}"
+      if [[ -z "$TARGET_SIZE_SPEC" ]]; then
+        echo "[ERROR] --target-size requires a value, e.g. --target-size=2GB" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    --max-height)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "[ERROR] --max-height requires a value, e.g. --max-height 720" >&2
+        exit 1
+      fi
+      MAX_HEIGHT_CLI="$2"
+      shift 2
+      ;;
+    --max-height=*)
+      MAX_HEIGHT_CLI="${1#*=}"
+      if [[ -z "$MAX_HEIGHT_CLI" ]]; then
+        echo "[ERROR] --max-height requires a value, e.g. --max-height=720" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    --audio)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "[ERROR] --audio requires a value: surround+stereo, surround, or stereo" >&2
+        exit 1
+      fi
+      AUDIO_MODE_CLI="$2"
+      shift 2
+      ;;
+    --audio=*)
+      AUDIO_MODE_CLI="${1#*=}"
+      if [[ -z "$AUDIO_MODE_CLI" ]]; then
+        echo "[ERROR] --audio requires a value: surround+stereo, surround, or stereo" >&2
+        exit 1
+      fi
+      shift
+      ;;
+    --quality-encode)
+      QUALITY_ENCODE_CLI="1"
+      shift
+      ;;
+    *)
+      echo "[ERROR] Unknown option: $1" >&2
+      print_usage
+      exit 1
+      ;;
+  esac
+done
 
 ############################################
 # Startup banner + basic env defaults
@@ -96,6 +216,8 @@ QSV_PRESET="${QSV_PRESET:-medium}"
 X264_CRF="${X264_CRF:-20}"
 X264_PRESET="${X264_PRESET:-veryfast}"
 X264_THREADS="${X264_THREADS:-6}"
+X265_CRF="${X265_CRF:-23}"
+X265_PRESET="${X265_PRESET:-slow}"
 USE_VBV="${USE_VBV:-1}"
 VBV_MAXRATE="${VBV_MAXRATE:-25000}"
 VBV_BUFSIZE="${VBV_BUFSIZE:-30000}"
@@ -103,6 +225,21 @@ AAC_STEREO_BR="${AAC_STEREO_BR:-192k}"
 AC3_51_BR="${AC3_51_BR:-640k}"
 TV_MAX_BYTES="${TV_MAX_BYTES:-1073741824}"  # 1 GiB default
 MP4_TAG_HEADROOM_BYTES="${MP4_TAG_HEADROOM_BYTES:-16777216}"  # 16 MiB reserved for later MetaFetch tags
+AUDIO_MODE="${AUDIO_MODE:-surround+stereo}" # surround+stereo|surround|stereo
+QUALITY_ENCODE="${QUALITY_ENCODE:-0}"       # 1 = software libx265 instead of QSV/x264
+MAX_HEIGHT="${MAX_HEIGHT:-0}"               # 0 = do not downscale
+TARGET_SIZE_BYTES=""
+
+[[ -n "$AUDIO_MODE_CLI" ]] && AUDIO_MODE="$AUDIO_MODE_CLI"
+[[ -n "$QUALITY_ENCODE_CLI" ]] && QUALITY_ENCODE="$QUALITY_ENCODE_CLI"
+[[ -n "$MAX_HEIGHT_CLI" ]] && MAX_HEIGHT="$MAX_HEIGHT_CLI"
+
+if [[ -n "$TARGET_SIZE_SPEC" ]]; then
+  if ! TARGET_SIZE_BYTES="$(parse_size_to_bytes "$TARGET_SIZE_SPEC")"; then
+    echo "[ERROR] Invalid --target-size: ${TARGET_SIZE_SPEC} (examples: 2GB, 700MB, 1536M)" >&2
+    exit 1
+  fi
+fi
 
 TIMING_IN_FLAGS=()
 TIMING_OUT_FLAGS=()
@@ -143,6 +280,40 @@ case "$ALLOW_UNTAGGED_AUDIO_FALLBACK" in
     ;;
 esac
 
+case "$AUDIO_MODE" in
+  surround+stereo|surround|stereo) ;;
+  *)
+    echo "[ERROR] Invalid AUDIO_MODE: ${AUDIO_MODE} (expected surround+stereo, surround, or stereo)" >&2
+    exit 1
+    ;;
+esac
+
+case "$QUALITY_ENCODE" in
+  0|1) ;;
+  *)
+    echo "[ERROR] Invalid QUALITY_ENCODE: ${QUALITY_ENCODE} (expected 0 or 1)" >&2
+    exit 1
+    ;;
+esac
+
+case "$MAX_HEIGHT" in
+  ''|*[!0-9]*)
+    echo "[ERROR] Invalid MAX_HEIGHT: ${MAX_HEIGHT} (expected non-negative integer pixels)" >&2
+    exit 1
+    ;;
+esac
+
+case "$TV_MAX_BYTES" in
+  ''|*[!0-9]*)
+    echo "[ERROR] Invalid TV_MAX_BYTES: ${TV_MAX_BYTES} (expected positive integer bytes)" >&2
+    exit 1
+    ;;
+esac
+if (( TV_MAX_BYTES <= 0 )); then
+  echo "[ERROR] Invalid TV_MAX_BYTES: ${TV_MAX_BYTES} (expected positive integer bytes)" >&2
+  exit 1
+fi
+
 case "$MP4_TAG_HEADROOM_BYTES" in
   ''|*[!0-9]*)
     echo "[ERROR] Invalid MP4_TAG_HEADROOM_BYTES: ${MP4_TAG_HEADROOM_BYTES} (expected non-negative integer bytes)" >&2
@@ -174,7 +345,11 @@ echo "convert.sh — MKV → MP4 batch converter" >&2
 echo "Found ${#FILES[@]} MKV file(s) in $(pwd)" >&2
 echo "Parallel jobs: ${JOBS}  OMDb interactive: ${OMDB_INTERACTIVE}  VERBOSE: ${VERBOSE}" >&2
 echo "Repair mode: ${REPAIR_MODE}  Subtitle mode: ${SUBTITLE_MODE}  Fast video copy: ${FAST_VIDEO_COPY}" >&2
-echo "Allow untagged audio fallback: ${ALLOW_UNTAGGED_AUDIO_FALLBACK}" >&2
+echo "Allow untagged audio fallback: ${ALLOW_UNTAGGED_AUDIO_FALLBACK}  Audio mode: ${AUDIO_MODE}" >&2
+echo "Quality encode: ${QUALITY_ENCODE}  Max height: ${MAX_HEIGHT}" >&2
+if [[ -n "$TARGET_SIZE_BYTES" ]]; then
+  echo "Target max bytes: ${TARGET_SIZE_BYTES} (from --target-size ${TARGET_SIZE_SPEC}; applies to all files)" >&2
+fi
 echo "TV max bytes: ${TV_MAX_BYTES}" >&2
 echo "MP4 tag headroom: ${MP4_TAG_HEADROOM_BYTES} bytes" >&2
 echo "========================================" >&2
@@ -636,8 +811,21 @@ build_audio_args_with_stereo_fallback() {
   local astream_idx="$1" acodec="$2" ach="$3"
   local -a args=()
   args+=(-map "0:${astream_idx}")
-  if [[ "$ach" -ge 6 ]]; then
-    if [[ "$acodec" == "eac3" || "$acodec" == "ac3" ]]; then
+  if [[ "$AUDIO_MODE" == "stereo" || "$ach" -lt 6 ]]; then
+    args+=(-c:a:0 aac -b:a:0 "$AAC_STEREO_BR" -ac:a:0 2 -disposition:a:0 default)
+    args+=(-metadata:s:a:0 title="English Stereo")
+    args+=(-metadata:s:a:0 language=eng)
+  elif [[ "$AUDIO_MODE" == "surround" ]]; then
+    if [[ -z "${TARGET_SIZE_BYTES:-}" && ( "$acodec" == "eac3" || "$acodec" == "ac3" ) ]]; then
+      args+=(-c:a:0 copy)
+    else
+      args+=(-c:a:0 ac3 -b:a:0 "$AC3_51_BR" -ac:a:0 6 -channel_layout:a:0 5.1)
+    fi
+    args+=(-disposition:a:0 default)
+    args+=(-metadata:s:a:0 title="English 5.1")
+    args+=(-metadata:s:a:0 language=eng)
+  else
+    if [[ -z "${TARGET_SIZE_BYTES:-}" && ( "$acodec" == "eac3" || "$acodec" == "ac3" ) ]]; then
       args+=(-c:a:0 copy)
     else
       args+=(-c:a:0 ac3 -b:a:0 "$AC3_51_BR" -ac:a:0 6 -channel_layout:a:0 5.1)
@@ -646,12 +834,22 @@ build_audio_args_with_stereo_fallback() {
     args+=(-disposition:a:0 default -disposition:a:1 0)
     args+=(-metadata:s:a:0 title="English 5.1" -metadata:s:a:1 title="English Stereo")
     args+=(-metadata:s:a:0 language=eng -metadata:s:a:1 language=eng)
-  else
-    args+=(-c:a:0 aac -b:a:0 "$AAC_STEREO_BR" -ac:a:0 2 -disposition:a:0 default)
-    args+=(-metadata:s:a:0 title="English Stereo")
-    args+=(-metadata:s:a:0 language=eng)
   fi
   printf '%s\n' "${args[@]}"
+}
+
+audio_total_kbps_for_budget() {
+  local ach="$1" ac3_kbps aac_kbps
+  ac3_kbps="${AC3_51_BR%k}"
+  aac_kbps="${AAC_STEREO_BR%k}"
+
+  if [[ "$AUDIO_MODE" == "stereo" || "$ach" -lt 6 ]]; then
+    printf "%s" "$aac_kbps"
+  elif [[ "$AUDIO_MODE" == "surround" ]]; then
+    printf "%s" "$ac3_kbps"
+  else
+    printf "%s" $((ac3_kbps + aac_kbps))
+  fi
 }
 
 x264_extra_args() {
@@ -700,24 +898,59 @@ file_size_bytes() {
   stat -c%s "$path" 2>/dev/null || stat -f%z "$path" 2>/dev/null
 }
 
-tv_payload_budget_bytes() {
-  local budget="$TV_MAX_BYTES"
+target_payload_budget_bytes() {
+  local budget="$1"
   if (( MP4_TAG_HEADROOM_BYTES > 0 && budget > MP4_TAG_HEADROOM_BYTES )); then
     budget=$((budget - MP4_TAG_HEADROOM_BYTES))
   fi
   printf "%s" "$budget"
 }
 
+target_max_bytes_for_type() {
+  local detected_type="$1"
+  if [[ -n "${TARGET_SIZE_BYTES:-}" ]]; then
+    printf "%s" "$TARGET_SIZE_BYTES"
+  elif [[ "$detected_type" == "tv" ]]; then
+    printf "%s" "$TV_MAX_BYTES"
+  fi
+}
+
+tv_payload_budget_bytes() {
+  target_payload_budget_bytes "$TV_MAX_BYTES"
+}
+
+build_video_filter_arg() {
+  local src="$1" subtitle_action="$2" forced_sub_pos="$3"
+  local -a filters=()
+
+  if (( MAX_HEIGHT > 0 )); then
+    filters+=("scale=-2:'min(${MAX_HEIGHT},ih)'")
+  fi
+
+  if [[ "$subtitle_action" == "burn" ]]; then
+    local subfile_esc
+    subfile_esc="$(ffmpeg_subtitles_filter_escape "$src")"
+    filters+=("subtitles='${subfile_esc}':si=${forced_sub_pos}")
+  fi
+
+  local IFS=,
+  printf "%s" "${filters[*]}"
+}
+
 can_use_fast_video_copy() {
   local file="$1" detected_type="$2" video_codec="$3" subtitle_action="$4"
   [[ "$FAST_VIDEO_COPY" == "1" ]] || return 1
   [[ "$subtitle_action" != "burn" ]] || return 1
+  [[ "$QUALITY_ENCODE" != "1" ]] || return 1
+  (( MAX_HEIGHT == 0 )) || return 1
   video_codec_can_copy_to_mp4 "$video_codec" || return 1
 
-  if [[ "$detected_type" == "tv" ]]; then
+  local target_max_bytes
+  target_max_bytes="$(target_max_bytes_for_type "$detected_type")"
+  if [[ -n "$target_max_bytes" ]]; then
     local source_size source_budget
     source_size="$(file_size_bytes "$file" 2>/dev/null || true)"
-    source_budget="$(tv_payload_budget_bytes)"
+    source_budget="$(target_payload_budget_bytes "$target_max_bytes")"
     [[ -n "$source_size" ]] || return 1
     [[ "$source_size" -le "$source_budget" ]] || return 1
   fi
@@ -784,8 +1017,9 @@ convert_from_source() {
   local astream_idx acodec ach video_codec selected_audio_kind audio_lang
   local forced_eng_sub_pos="" subtitle_codec="" subtitle_action="none"
   local VIDEO_BITRATE="" encode_ok=0
-  local -a audio_args=() x264_extras=() subtitle_args=() video_copy_args=()
-  local subfile_esc vf_arg duration target_bps ac3_kbps aac_kbps audio_total_kbps audio_total_bps video_bps video_kbps final_size
+  local -a audio_args=() x264_extras=() subtitle_args=() video_copy_args=() vf_args=()
+  local vf_arg duration target_bps audio_total_kbps audio_total_bps video_bps video_kbps final_size
+  local size_cap_bytes size_cap_label
   local fast_copy_log="" fast_copy_had_dts=0
 
   IFS='|' read -r astream_idx selected_audio_kind <<< "$(pick_audio_stream_index "$src" || true)"
@@ -805,9 +1039,9 @@ convert_from_source() {
   fi
 
   if [[ -n "$audio_lang" ]]; then
-    echo "[AUDIO] primary=0:${astream_idx} codec=${acodec} ch=${ach} lang=${audio_lang} (English only; stereo fallback if 5.1+)" >&2
+    echo "[AUDIO] mode=${AUDIO_MODE} primary=0:${astream_idx} codec=${acodec} ch=${ach} lang=${audio_lang}" >&2
   else
-    echo "[AUDIO] primary=0:${astream_idx} codec=${acodec} ch=${ach} lang=untagged (English only; stereo fallback if 5.1+)" >&2
+    echo "[AUDIO] mode=${AUDIO_MODE} primary=0:${astream_idx} codec=${acodec} ch=${ach} lang=untagged" >&2
   fi
   [[ -n "$video_codec" ]] && echo "[VIDEO] source codec=${video_codec}" >&2
 
@@ -836,8 +1070,6 @@ convert_from_source() {
   case "$subtitle_action" in
     burn)
       echo "[SUBS ] Forced English subtitles -> burn into video" >&2
-      subfile_esc="$(ffmpeg_subtitles_filter_escape "$src")"
-      vf_arg="subtitles='${subfile_esc}':si=${forced_eng_sub_pos}"
       ;;
     copy)
       echo "[SUBS ] Forced English subtitles -> keep in MP4 as mov_text" >&2
@@ -849,6 +1081,12 @@ convert_from_source() {
       echo "[SUBS ] No forced English subtitles kept" >&2
       ;;
   esac
+
+  vf_arg="$(build_video_filter_arg "$src" "$subtitle_action" "$forced_eng_sub_pos")"
+  if [[ -n "$vf_arg" ]]; then
+    vf_args=(-vf "$vf_arg")
+    echo "[VIDEO] filter=${vf_arg}" >&2
+  fi
 
   if can_use_fast_video_copy "$src" "$detected_type" "$video_codec" "$subtitle_action"; then
     echo "[FAST ] Compatible ${video_codec} video -> MP4 copy path" >&2
@@ -905,20 +1143,15 @@ convert_from_source() {
     fi
   fi
 
-  if [[ "$detected_type" == "tv" ]]; then
+  size_cap_bytes="$(target_max_bytes_for_type "$detected_type")"
+  if [[ -n "$size_cap_bytes" ]]; then
     duration="$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$src" 2>/dev/null || echo "")"
     if [[ -n "$duration" ]]; then
       if awk "BEGIN{exit !($duration > 0)}"; then
         local target_payload_bytes
-        target_payload_bytes="$(tv_payload_budget_bytes)"
+        target_payload_bytes="$(target_payload_budget_bytes "$size_cap_bytes")"
         target_bps="$(awk -v bytes="$target_payload_bytes" -v dur="$duration" 'BEGIN{printf "%.0f", (bytes*8)/dur}')"
-        ac3_kbps="${AC3_51_BR%k}"
-        aac_kbps="${AAC_STEREO_BR%k}"
-        if [[ "$ach" -ge 6 ]]; then
-          audio_total_kbps=$((ac3_kbps + aac_kbps))
-        else
-          audio_total_kbps=$((aac_kbps))
-        fi
+        audio_total_kbps="$(audio_total_kbps_for_budget "$ach")"
         audio_total_bps=$((audio_total_kbps * 1000))
         video_bps="$(awk -v t="$target_bps" -v a="$audio_total_bps" 'BEGIN{v=t-a; if(v<100000) v=100000; printf "%.0f", v}')"
         video_kbps=$(( (video_bps + 500) / 1000 ))
@@ -926,7 +1159,12 @@ convert_from_source() {
           video_kbps=200
         fi
         VIDEO_BITRATE="${video_kbps}k"
-        echo "[SIZE ] TV episode detected — target max size: ${TV_MAX_BYTES} bytes; tag headroom=${MP4_TAG_HEADROOM_BYTES}; media budget=${target_payload_bytes}; duration=${duration}s; video bitrate=${VIDEO_BITRATE}" >&2
+        if [[ -n "${TARGET_SIZE_BYTES:-}" ]]; then
+          size_cap_label="requested target"
+        else
+          size_cap_label="TV episode target"
+        fi
+        echo "[SIZE ] ${size_cap_label}: max size=${size_cap_bytes} bytes; tag headroom=${MP4_TAG_HEADROOM_BYTES}; media budget=${target_payload_bytes}; audio budget=${audio_total_kbps}k; duration=${duration}s; video bitrate=${VIDEO_BITRATE}" >&2
       else
         echo "[WARN ] Could not parse duration for size calc; skipping size cap" >&2
       fi
@@ -935,7 +1173,42 @@ convert_from_source() {
     fi
   fi
 
-  if [[ "$subtitle_action" == "burn" ]]; then
+  if [[ "$QUALITY_ENCODE" == "1" ]]; then
+    echo "[X265 ] Quality encode -> software HEVC (${X265_PRESET})" >&2
+    if [[ -n "$VIDEO_BITRATE" ]]; then
+      if "$FFMPEG" -y -stats \
+          "${TIMING_IN_FLAGS[@]}" \
+          -i "$src" \
+          "${TIMING_OUT_FLAGS[@]}" \
+          -map 0:v:0 \
+          "${audio_args[@]}" \
+          "${subtitle_args[@]}" \
+          "${vf_args[@]}" \
+          -c:v libx265 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X265_PRESET" -tag:v hvc1 \
+          "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
+        encode_ok=1
+      else
+        echo "[WARN ] Quality encode failed; falling back to standard encoder path" >&2
+      fi
+    else
+      if "$FFMPEG" -y -stats \
+          "${TIMING_IN_FLAGS[@]}" \
+          -i "$src" \
+          "${TIMING_OUT_FLAGS[@]}" \
+          -map 0:v:0 \
+          "${audio_args[@]}" \
+          "${subtitle_args[@]}" \
+          "${vf_args[@]}" \
+          -c:v libx265 -crf "$X265_CRF" -preset "$X265_PRESET" -tag:v hvc1 \
+          "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
+        encode_ok=1
+      else
+        echo "[WARN ] Quality encode failed; falling back to standard encoder path" >&2
+      fi
+    fi
+  fi
+
+  if [[ "$encode_ok" -ne 1 && "$subtitle_action" == "burn" ]]; then
     echo "[CPU  ] Forced English subs -> burn-in (x264)" >&2
     if [[ -n "$VIDEO_BITRATE" ]]; then
       if "$FFMPEG" -y -stats \
@@ -944,7 +1217,7 @@ convert_from_source() {
           "${TIMING_OUT_FLAGS[@]}" \
           -map 0:v:0 \
           "${audio_args[@]}" \
-          -vf "$vf_arg" \
+          "${vf_args[@]}" \
           -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
           "${x264_extras[@]}" \
           "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
@@ -957,14 +1230,14 @@ convert_from_source() {
           "${TIMING_OUT_FLAGS[@]}" \
           -map 0:v:0 \
           "${audio_args[@]}" \
-          -vf "$vf_arg" \
+          "${vf_args[@]}" \
           -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
           "${x264_extras[@]}" \
           "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
         encode_ok=1
       fi
     fi
-  else
+  elif [[ "$encode_ok" -ne 1 ]]; then
     echo "[QSV  ] No forced-English burn -> HEVC QSV" >&2
     if [[ -n "$VIDEO_BITRATE" ]]; then
       if "$FFMPEG" -y -stats \
@@ -974,6 +1247,7 @@ convert_from_source() {
           -map 0:v:0 \
           "${audio_args[@]}" \
           "${subtitle_args[@]}" \
+          "${vf_args[@]}" \
           -c:v hevc_qsv -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -preset "$QSV_PRESET" -tag:v hvc1 \
           "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
         encode_ok=1
@@ -986,6 +1260,7 @@ convert_from_source() {
             -map 0:v:0 \
             "${audio_args[@]}" \
             "${subtitle_args[@]}" \
+            "${vf_args[@]}" \
             -c:v libx264 -b:v "$VIDEO_BITRATE" -maxrate "$VIDEO_BITRATE" -bufsize "${VBV_BUFSIZE}k" -preset "$X264_PRESET" \
             "${x264_extras[@]}" \
             "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
@@ -1000,6 +1275,7 @@ convert_from_source() {
           -map 0:v:0 \
           "${audio_args[@]}" \
           "${subtitle_args[@]}" \
+          "${vf_args[@]}" \
           -c:v hevc_qsv -global_quality "$QSV_GLOBAL_QUALITY" -preset "$QSV_PRESET" -tag:v hvc1 \
           "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
         encode_ok=1
@@ -1012,6 +1288,7 @@ convert_from_source() {
             -map 0:v:0 \
             "${audio_args[@]}" \
             "${subtitle_args[@]}" \
+            "${vf_args[@]}" \
             -c:v libx264 -crf "$X264_CRF" -preset "$X264_PRESET" \
             "${x264_extras[@]}" \
             "${MP4_OUTPUT_FLAGS[@]}" "$out"; then
@@ -1031,10 +1308,10 @@ convert_from_source() {
       echo "[WARN ] Failed to extract forced English subtitle sidecar" >&2
   fi
 
-  if [[ "$detected_type" == "tv" && -n "$VIDEO_BITRATE" ]]; then
+  if [[ -n "$size_cap_bytes" && -n "$VIDEO_BITRATE" ]]; then
     final_size="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
-    if [[ -n "$final_size" && "$final_size" -gt "$TV_MAX_BYTES" ]]; then
-      echo "[WARN ] Final file exceeds ${TV_MAX_BYTES} bytes: ${final_size} bytes" >&2
+    if [[ -n "$final_size" && "$final_size" -gt "$size_cap_bytes" ]]; then
+      echo "[WARN ] Final file exceeds ${size_cap_bytes} bytes: ${final_size} bytes" >&2
     fi
   fi
 
