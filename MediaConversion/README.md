@@ -14,7 +14,7 @@
 - Retries with a repaired MKV only when needed in `REPAIR_MODE=auto`.
 - Uses Intel QSV HEVC when forced subtitle burn-in is not needed, with CPU fallback.
 - Supports explicit output size targets such as `--target-size 2GB`.
-- Supports quality controls for tight targets: `--max-height`, `--audio`, and `--quality-encode`.
+- Supports quality controls for tight targets: `--max-height`, `--audio`, `--quality-encode`, and `--x265-preset`.
 - Looks up OMDb metadata, downloads poster art, and tags the finished MP4.
 - Renames output files from confirmed OMDb matches.
 - Avoids silently overwriting an existing MP4 by picking a unique output name.
@@ -61,10 +61,22 @@ Only scan the current directory and report whether each file has forced English 
 Aim to keep each output MP4 under about 2 GiB. This is a best-effort bitrate budget, not a guarantee.
 
 ```bash
-./convert.sh --target-size 2GB --max-height 720 --audio stereo --quality-encode
+./convert.sh --target-size 2GB --max-height 720 --audio stereo
 ```
 
-Recommended when shrinking a large source, such as a 20 GiB movie, down to a very small target. It downscales to 720p, keeps only an AAC stereo track, and uses slower software HEVC for better compression quality than the fast hardware path.
+Fastest recommended command when shrinking a large source, such as a 20 GiB movie, down to a very small target. It downscales to 720p, keeps only an AAC stereo track, and uses the hardware HEVC path.
+
+```bash
+./convert.sh --target-size 2GB --max-height 720 --audio stereo --quality-encode --x265-preset fast
+```
+
+Balanced quality command for small targets. It uses software HEVC for better compression quality than the fast hardware path, but `--x265-preset fast` keeps it from becoming painfully slow.
+
+```bash
+./convert.sh --target-size 2GB --max-height 720 --audio stereo --quality-encode --x265-preset slow
+```
+
+Best-quality command for small targets. This can be very slow because software HEVC at slower presets spends much more CPU time searching for better compression decisions.
 
 ## CLI options
 
@@ -94,7 +106,13 @@ Audio output mode:
 --quality-encode
 ```
 
-Use slower software HEVC (`libx265`) instead of the fast QSV path. This is useful for small target sizes where compression efficiency matters more than speed.
+Use software HEVC (`libx265`) instead of the fast QSV path. This is useful for small target sizes where compression efficiency matters more than speed.
+
+```bash
+--x265-preset PRESET
+```
+
+Choose the software HEVC speed/quality preset for `--quality-encode`. Supported values are `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow`, and `placebo`. The default is `medium`; use `fast` for a more practical runtime, or `slow` when quality matters more than time.
 
 ## Useful environment overrides
 
@@ -114,7 +132,7 @@ AUDIO_MODE=surround+stereo
 QUALITY_ENCODE=0
 MAX_HEIGHT=0
 X265_CRF=23
-X265_PRESET=slow
+X265_PRESET=medium
 MP4_TAG_HEADROOM_BYTES=16777216
 ```
 
@@ -140,10 +158,10 @@ ALLOW_UNTAGGED_AUDIO_FALLBACK=1 ./convert.sh
 
 - The script works on the current directory only.
 - `--target-size` is best effort. Final size can vary because encoder decisions, audio streams, subtitles, and MP4 metadata overhead are not perfectly predictable.
-- Very small targets need tradeoffs. For example, converting a 20 GiB 1080p or 4K movie to 2 GiB will usually look better with `--max-height 720 --audio stereo --quality-encode`.
+- Very small targets need tradeoffs. For example, converting a 20 GiB 1080p or 4K movie to 2 GiB will usually look better with `--max-height 720 --audio stereo`; add `--quality-encode --x265-preset fast` if the hardware path still looks rough.
 - Parallel OMDb log writes are synchronized when `flock` is available.
 - If a QSV encode fails, the script falls back to CPU x264 encoding.
-- `--quality-encode` uses CPU HEVC and is much slower than QSV, but usually looks better at constrained bitrates.
+- `--quality-encode` uses CPU HEVC and is much slower than QSV, but usually looks better at constrained bitrates. `--x265-preset fast` is a good compromise; `slow` can be dramatically slower.
 - Forced English subtitle burn-in uses CPU encoding because subtitles are rendered into the video stream.
 - `SUBTITLE_MODE=copy` keeps only forced English text subtitles inside the MP4; image-based forced subtitles fall back to sidecar extraction.
 - `ALLOW_UNTAGGED_AUDIO_FALLBACK=1` is useful for files with English audio that is missing a language tag; set it to `0` if you want the script to fail closed instead.

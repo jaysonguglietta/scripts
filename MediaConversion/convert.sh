@@ -31,7 +31,7 @@
 #   ./convert.sh --target-size 2GB
 #     - Aim to keep each output MP4 under ~2 GiB (best-effort bitrate cap).
 #
-#   ./convert.sh --target-size 2GB --max-height 720 --audio stereo --quality-encode
+#   ./convert.sh --target-size 2GB --max-height 720 --audio stereo --quality-encode --x265-preset fast
 #     - Better quality when shrinking large sources to a small file: downscale,
 #       spend less on audio, and use slower software HEVC instead of fast QSV.
 #
@@ -67,12 +67,14 @@ shopt -s nullglob
 #   --max-height N    : downscale video to at most N pixels high
 #   --audio MODE     : surround+stereo|surround|stereo
 #   --quality-encode : use slower software HEVC for better compression quality
+#   --x265-preset P  : libx265 speed/quality preset for --quality-encode
 ############################################
 MODE="convert"
 TARGET_SIZE_SPEC=""
 MAX_HEIGHT_CLI=""
 AUDIO_MODE_CLI=""
 QUALITY_ENCODE_CLI=""
+X265_PRESET_CLI=""
 
 print_usage() {
   cat >&2 <<'EOF'
@@ -84,6 +86,7 @@ Options:
   --max-height HEIGHT       downscale video to at most HEIGHT pixels high, e.g. 720
   --audio MODE              surround+stereo, surround, or stereo
   --quality-encode          use slower software HEVC for better quality at small sizes
+  --x265-preset PRESET      libx265 preset: fast, medium, slow, etc. (default: medium)
   --print-subs-only         scan current dir for MKV and report forced English subtitles
   -h, --help                show this help
 
@@ -92,7 +95,8 @@ Environment overrides:
   REPAIR_MODE=auto|always|never, SUBTITLE_MODE=burn|copy|extract,
   FAST_VIDEO_COPY=0|1, ALLOW_UNTAGGED_AUDIO_FALLBACK=0|1,
   AUDIO_MODE=surround+stereo|surround|stereo, QUALITY_ENCODE=0|1,
-  MAX_HEIGHT=0, TV_MAX_BYTES=1073741824, MP4_TAG_HEADROOM_BYTES=16777216, ...
+  X265_PRESET=medium, MAX_HEIGHT=0, TV_MAX_BYTES=1073741824,
+  MP4_TAG_HEADROOM_BYTES=16777216, ...
 EOF
 }
 
@@ -186,6 +190,22 @@ while [[ $# -gt 0 ]]; do
       QUALITY_ENCODE_CLI="1"
       shift
       ;;
+    --x265-preset)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "[ERROR] --x265-preset requires a value, e.g. --x265-preset fast" >&2
+        exit 1
+      fi
+      X265_PRESET_CLI="$2"
+      shift 2
+      ;;
+    --x265-preset=*)
+      X265_PRESET_CLI="${1#*=}"
+      if [[ -z "$X265_PRESET_CLI" ]]; then
+        echo "[ERROR] --x265-preset requires a value, e.g. --x265-preset=fast" >&2
+        exit 1
+      fi
+      shift
+      ;;
     *)
       echo "[ERROR] Unknown option: $1" >&2
       print_usage
@@ -217,7 +237,7 @@ X264_CRF="${X264_CRF:-20}"
 X264_PRESET="${X264_PRESET:-veryfast}"
 X264_THREADS="${X264_THREADS:-6}"
 X265_CRF="${X265_CRF:-23}"
-X265_PRESET="${X265_PRESET:-slow}"
+X265_PRESET="${X265_PRESET:-medium}"
 USE_VBV="${USE_VBV:-1}"
 VBV_MAXRATE="${VBV_MAXRATE:-25000}"
 VBV_BUFSIZE="${VBV_BUFSIZE:-30000}"
@@ -233,6 +253,7 @@ TARGET_SIZE_BYTES=""
 [[ -n "$AUDIO_MODE_CLI" ]] && AUDIO_MODE="$AUDIO_MODE_CLI"
 [[ -n "$QUALITY_ENCODE_CLI" ]] && QUALITY_ENCODE="$QUALITY_ENCODE_CLI"
 [[ -n "$MAX_HEIGHT_CLI" ]] && MAX_HEIGHT="$MAX_HEIGHT_CLI"
+[[ -n "$X265_PRESET_CLI" ]] && X265_PRESET="$X265_PRESET_CLI"
 
 if [[ -n "$TARGET_SIZE_SPEC" ]]; then
   if ! TARGET_SIZE_BYTES="$(parse_size_to_bytes "$TARGET_SIZE_SPEC")"; then
@@ -303,6 +324,14 @@ case "$MAX_HEIGHT" in
     ;;
 esac
 
+case "$X265_PRESET" in
+  ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo) ;;
+  *)
+    echo "[ERROR] Invalid X265_PRESET: ${X265_PRESET} (expected ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo)" >&2
+    exit 1
+    ;;
+esac
+
 case "$TV_MAX_BYTES" in
   ''|*[!0-9]*)
     echo "[ERROR] Invalid TV_MAX_BYTES: ${TV_MAX_BYTES} (expected positive integer bytes)" >&2
@@ -346,7 +375,7 @@ echo "Found ${#FILES[@]} MKV file(s) in $(pwd)" >&2
 echo "Parallel jobs: ${JOBS}  OMDb interactive: ${OMDB_INTERACTIVE}  VERBOSE: ${VERBOSE}" >&2
 echo "Repair mode: ${REPAIR_MODE}  Subtitle mode: ${SUBTITLE_MODE}  Fast video copy: ${FAST_VIDEO_COPY}" >&2
 echo "Allow untagged audio fallback: ${ALLOW_UNTAGGED_AUDIO_FALLBACK}  Audio mode: ${AUDIO_MODE}" >&2
-echo "Quality encode: ${QUALITY_ENCODE}  Max height: ${MAX_HEIGHT}" >&2
+echo "Quality encode: ${QUALITY_ENCODE}  X265 preset: ${X265_PRESET}  Max height: ${MAX_HEIGHT}" >&2
 if [[ -n "$TARGET_SIZE_BYTES" ]]; then
   echo "Target max bytes: ${TARGET_SIZE_BYTES} (from --target-size ${TARGET_SIZE_SPEC}; applies to all files)" >&2
 fi
