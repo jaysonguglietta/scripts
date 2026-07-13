@@ -1,0 +1,23 @@
+[Unit]
+Description=Open WebUI for the local Ollama server
+Documentation=https://github.com/jaysonguglietta/scripts/tree/main/SystemUpdates
+Wants=network-online.target ollama.service
+After=network-online.target ollama.service
+
+[Container]
+Image=ghcr.io/open-webui/open-webui:main
+ContainerName=open-webui
+PublishPort=3000:8080
+Volume=open-webui:/app/backend/data
+AddHost=host.containers.internal:host-gateway
+Environment=OLLAMA_BASE_URL=http://host.containers.internal:11434
+EnvironmentFile=/etc/open-webui/open-webui.env
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=900
+TimeoutStopSec=70
+
+[Install]
+WantedBy=multi-user.target

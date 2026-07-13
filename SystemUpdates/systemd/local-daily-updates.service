@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily operating-system and Local LLM maintenance
+Documentation=https://github.com/jaysonguglietta/scripts/tree/main/SystemUpdates
+Wants=network-online.target ollama.service
+After=network-online.target ollama.service
+ConditionFileIsExecutable=/usr/local/sbin/updates.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/updates.sh --verbose
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+UMask=0077
+TimeoutStartSec=12h

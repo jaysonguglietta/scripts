@@ -1,77 +1,227 @@
 # SystemUpdates
 
-`updates.sh` is a Bash maintenance script for Fedora and Debian-family servers. It updates system packages, writes a timestamped log, checks whether a reboot is recommended, and can also refresh local AI components such as Ollama, installed Ollama models, and an Open WebUI Podman container.
+A reproducible Fedora local-LLM build and daily-maintenance bundle for a
+CPU-only server.
 
-## What it does
+The documented reference system is a quad-core Intel i7 with 32 GB RAM, a
+250 GB SSD, no GPU, and one or two users. It runs Ollama on the host and Open
+WebUI as a systemd-managed Podman container.
 
-- Detects `dnf5`, `dnf`, or `apt-get` automatically.
-- Refreshes package metadata and installs available updates.
-- Removes unneeded packages and cleans caches after a real run.
-- Writes a timestamped log file for each run.
-- Supports a verbose mode with system details, pending updates, and before/after disk usage.
-- Reports whether a reboot is recommended when the platform exposes that signal.
-- Updates Ollama when it is installed.
-- Re-pulls installed Ollama model tags so local models stay current.
-- Pulls the current Open WebUI image and recreates the `open-webui` Podman container when the image changed.
-- Re-runs itself with `sudo` automatically when needed.
+Current maintenance script: **`updates.sh` 2.2.1**
 
-## Usage
+## Documentation
 
-```bash
-./updates.sh
+- [Complete installation and rebuild](docs/INSTALL.md)
+- [Routine operations, models, updates, and backups](docs/OPERATIONS.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Security and privacy](docs/SECURITY.md)
+
+## Repository layout
+
+```text
+SystemUpdates/
+├── README.md
+├── updates.sh
+├── docs/
+│   ├── INSTALL.md
+│   ├── OPERATIONS.md
+│   ├── SECURITY.md
+│   └── TROUBLESHOOTING.md
+├── modelfiles/
+│   ├── business-assistant.modelfile
+│   ├── coding-assistant.modelfile
+│   ├── fast-assistant.modelfile
+│   ├── general-assistant.modelfile
+│   ├── reasoning-assistant.modelfile
+│   └── writing-assistant.modelfile
+├── quadlet/
+│   ├── open-webui.container
+│   └── open-webui.env.example
+└── systemd/
+    ├── local-daily-updates.service
+    ├── local-daily-updates.timer
+    └── ollama.service.d/
+        └── override.conf
 ```
 
-Run a normal update and write a log to `/var/log/system-updates` when possible.
+The repository contains templates only. The real Open WebUI secret is created
+under `/etc/open-webui` and is never committed.
 
-```bash
-./updates.sh --dry-run
+## Architecture
+
+```text
+Trusted LAN users
+        |
+        | TCP 3000
+        v
+Open WebUI Podman container
+        |
+        | http://host.containers.internal:11434
+        v
+Ollama systemd service
+        |
+        v
+Local base models and friendly assistants
 ```
 
-Preview package changes without applying them.
+Port `11434` is intentionally not exposed through `firewalld`. Open WebUI is
+the user-facing entry point.
+
+## Quick start
+
+On a new Fedora server, follow
+[the complete installation guide](docs/INSTALL.md). The condensed sequence is:
 
 ```bash
-./updates.sh --verbose
+sudo dnf install -y curl firewalld git htop openssl podman
+sudo systemctl enable --now firewalld
+
+sudo mkdir -p /opt
+cd /opt
+sudo git clone https://github.com/jaysonguglietta/scripts.git
+
+curl -fsSL https://ollama.com/install.sh | sh
+sudo systemctl enable --now ollama.service
 ```
 
-Show extra detail before and after the update run.
+Then install the supplied templates exactly as documented in
+[INSTALL.md](docs/INSTALL.md). That guide includes:
+
+- Ollama's container-reachable systemd configuration
+- base-model downloads
+- friendly-assistant creation
+- the Open WebUI secret
+- a modern Podman Quadlet
+- LAN-only firewall rules
+- the daily maintenance script and timer
+- migration from the deprecated `podman generate systemd` workflow
+
+## Friendly assistants
+
+| Friendly choice | Base model | Use |
+|---|---|---|
+| `business-assistant` | `qwen2.5:7b` | Business, cloud, security, and policy work |
+| `coding-assistant` | `qwen2.5-coder:7b` | Programming and infrastructure as code |
+| `fast-assistant` | `gemma3:4b` | Faster routine questions |
+| `general-assistant` | `qwen3:8b` | General-purpose chat |
+| `reasoning-assistant` | `deepseek-r1:7b` | Analysis and troubleshooting |
+| `writing-assistant` | `llama3.1:8b` | Editing and professional writing |
+
+The technical base names remain installed because the friendly models reference
+them. Open WebUI can hide the technical names from normal users.
+
+## What the daily script updates
+
+A normal run:
+
+1. Updates Fedora/DNF or Debian/APT packages.
+2. Updates Ollama.
+3. Discovers every installed base model and every `FROM` reference in
+   `/etc/ollama/modelfiles`.
+4. Pulls the base-model tags.
+5. Skips locally created friendly names during the pull phase.
+6. Rebuilds every friendly model.
+7. Pulls the configured Open WebUI image.
+8. Restarts Open WebUI only when required.
+9. Performs HTTP health checks.
+10. Reports whether a reboot is recommended.
+11. Writes a private timestamped log and summary.
+
+It does not reboot automatically, delete models, delete Podman volumes, or
+delete Open WebUI data.
+
+## Install or refresh the maintenance script
 
 ```bash
-LOG_DIR=/path/to/logs ./updates.sh --verbose --no-reboot-check
+cd /opt/scripts
+sudo git pull --ff-only
+
+sudo install \
+  -o root \
+  -g root \
+  -m 0750 \
+  SystemUpdates/updates.sh \
+  /usr/local/sbin/updates.sh
+
+sudo bash -n /usr/local/sbin/updates.sh
+sudo /usr/local/sbin/updates.sh --version
 ```
 
-Store logs in a custom location, turn on verbose output, and skip the reboot check.
+Expected:
+
+```text
+updates.sh 2.2.1
+```
+
+Preview the AI work:
 
 ```bash
-./updates.sh --skip-ai
+sudo /usr/local/sbin/updates.sh \
+  --only-ai \
+  --dry-run \
+  --verbose
 ```
 
-Run only the operating system package updates and reboot check.
+Run it:
 
 ```bash
-./updates.sh --skip-models
+sudo /usr/local/sbin/updates.sh --only-ai --verbose
 ```
 
-Update Ollama and Open WebUI, but do not re-pull installed Ollama models.
+Show every option:
 
 ```bash
-./updates.sh --skip-open-webui
+sudo /usr/local/sbin/updates.sh --help
 ```
 
-Update packages, Ollama, and installed Ollama models without touching the Open WebUI container.
+## Supported Open WebUI service names
+
+The script detects:
+
+```text
+open-webui.service             # Recommended Quadlet
+container-open-webui.service   # Legacy generated service
+```
+
+Use only one. New installations should use
+[`quadlet/open-webui.container`](quadlet/open-webui.container).
+
+## Daily schedule
+
+The supplied timer runs at 03:15 server-local time with up to 30 minutes of
+random delay:
 
 ```bash
-OPEN_WEBUI_CONTAINER=my-open-webui ./updates.sh
+sudo install -o root -g root -m 0644 \
+  SystemUpdates/systemd/local-daily-updates.service \
+  /etc/systemd/system/local-daily-updates.service
+
+sudo install -o root -g root -m 0644 \
+  SystemUpdates/systemd/local-daily-updates.timer \
+  /etc/systemd/system/local-daily-updates.timer
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now local-daily-updates.timer
+systemctl list-timers local-daily-updates.timer
 ```
 
-Use a custom Podman container name for the Open WebUI update.
+## Important update-policy choice
 
-## Notes
+The supplied Quadlet tracks:
 
-- On Fedora, reboot detection uses `needs-restarting -r` when that command is installed.
-- On Debian and Ubuntu, reboot detection uses `/var/run/reboot-required`.
-- `apt-get update` still refreshes package metadata during `--dry-run` so the preview uses current repository data.
-- `--dry-run` previews package, Ollama, model, and Open WebUI actions without applying AI component updates.
-- Ollama is restarted after an RPM-managed package update or a downloaded installer run when `systemctl` can restart it.
-- Open WebUI updates require `podman`; the script looks first for a root-owned container and then for a rootless container owned by the original `sudo` user.
-- Before recreating Open WebUI, the script saves the existing container inspection JSON beside the run log.
-- You can also enable the same extra output with `VERBOSE=1 ./updates.sh`.
+```text
+ghcr.io/open-webui/open-webui:main
+```
+
+Open WebUI recommends `:main` for personal/homelab systems that prioritize the
+latest build, while a shared or critical system should pin and test a specific
+release. Back up the Open WebUI volume before updates that may include database
+migrations.
+
+## Official references
+
+- <https://docs.ollama.com/faq>
+- <https://docs.ollama.com/modelfile>
+- <https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html>
+- <https://docs.openwebui.com/getting-started/quick-start/>
+- <https://docs.openwebui.com/getting-started/updating/>
