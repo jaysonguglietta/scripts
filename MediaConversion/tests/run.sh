@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sourced-module state and the mocked AtomicParsley function are consumed dynamically.
-# shellcheck disable=SC2034,SC2329
+# shellcheck disable=SC1091,SC2034,SC2317,SC2329
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

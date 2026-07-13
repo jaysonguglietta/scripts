@@ -380,7 +380,7 @@ process_one() (
   local used_repaired=0 detected_type file_name actual_size retry=0 retry_bitrate=""
   WORKER_DIRECTORY=""
 
-  # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
+  # shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
   cleanup_worker() {
     [[ -n "${WORKER_DIRECTORY:-}" ]] && cleanup_worker_directory "$WORKER_DIRECTORY"
   }
@@ -493,7 +493,9 @@ process_one() (
     fi
   fi
 
-  printf '[DONE ] %s -> %s%s\n' "$input" "$(basename "$output")" "$([[ "$used_repaired" == 1 ]] && printf ' (repaired)' || true)" >&2
+  local completion_note=""
+  [[ "$used_repaired" == 1 ]] && completion_note=' (repaired)'
+  printf '[DONE ] %s -> %s%s\n' "$input" "$(basename "$output")" "$completion_note" >&2
   [[ "$VERBOSE" == "1" ]] && set +x
   return 0
 )

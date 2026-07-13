@@ -377,9 +377,11 @@ append_omdb_log_line() {
 
   (
     local lock_directory="${OMDB_LOG_LOCK}.d" attempt=0 acquired=0
-    # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
+    # shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
     cleanup_log_lock() {
-      (( acquired == 1 )) && rmdir "$lock_directory" 2>/dev/null || true
+      if (( acquired == 1 )); then
+        rmdir "$lock_directory" 2>/dev/null || true
+      fi
     }
     trap cleanup_log_lock EXIT
     trap 'exit 130' INT TERM
