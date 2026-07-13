@@ -6,6 +6,10 @@ ORIGINAL_ARGS=("$@")
 DRY_RUN=0
 VERBOSE="${VERBOSE:-0}"
 CHECK_REBOOT=1
+UPDATE_AI=1
+UPDATE_OLLAMA_MODELS=1
+UPDATE_OPEN_WEBUI=1
+OPEN_WEBUI_CONTAINER="${OPEN_WEBUI_CONTAINER:-open-webui}"
 CUSTOM_LOG_DIR="${LOG_DIR:-}"
 PACKAGE_MANAGER=""
 PACKAGE_FAMILY=""
@@ -34,11 +38,16 @@ Options:
   -v, --verbose         Show system details and pending update information.
   --log-dir DIR         Write logs to DIR.
   --no-reboot-check     Skip reboot-required detection.
+  --skip-ai             Skip Ollama, model, and Open WebUI updates.
+  --skip-models         Update Ollama but do not refresh installed models.
+  --skip-open-webui     Do not update the Open WebUI container.
   -h, --help            Show this help text.
 
 Defaults:
   - Logs go to /var/log/system-updates when possible.
   - Logs fall back to /tmp/system-updates if needed.
+  - Installed Ollama models are refreshed by re-pulling their existing tags.
+  - Open WebUI is updated only when a container named open-webui exists.
 EOF
 }
 
@@ -248,6 +257,190 @@ update_with_apt() {
   fi
 }
 
+
+update_ollama() {
+  local ollama_bin=""
+  local before_version=""
+  local after_version=""
+  local installer=""
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    log "Ollama is not installed; skipping Ollama and model updates."
+    return 0
+  fi
+
+  ollama_bin="$(command -v ollama)"
+  before_version="$(ollama --version 2>/dev/null || true)"
+  printf '\n'
+  log "Updating Ollama"
+  [[ -n "$before_version" ]] && log "Current Ollama version: $before_version"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "Dry run enabled: would update Ollama and restart its service."
+  elif command -v rpm >/dev/null 2>&1 && rpm -qf "$ollama_bin" >/dev/null 2>&1; then
+    log "Ollama is RPM-managed and was handled by the system package update."
+    systemctl restart ollama 2>/dev/null || true
+  else
+    installer="$(mktemp /tmp/ollama-install.XXXXXX.sh)"
+    if curl --fail --silent --show-error --location \
+      https://ollama.com/install.sh --output "$installer"; then
+      chmod 700 "$installer"
+      run_cmd "Installing the latest Ollama release" sh "$installer"
+      systemctl restart ollama 2>/dev/null || true
+    else
+      rm -f "$installer"
+      die "Unable to download the Ollama installer."
+    fi
+    rm -f "$installer"
+  fi
+
+  after_version="$(ollama --version 2>/dev/null || true)"
+  [[ -n "$after_version" ]] && log "Installed Ollama version: $after_version"
+}
+
+update_ollama_models() {
+  local model=""
+  local -a models=()
+
+  if [[ "$UPDATE_OLLAMA_MODELS" -ne 1 ]]; then
+    log "Skipping Ollama model updates by request."
+    return 0
+  fi
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! systemctl is-active --quiet ollama 2>/dev/null; then
+    log "Ollama service is not active; skipping model updates."
+    return 0
+  fi
+
+  mapfile -t models < <(ollama list 2>/dev/null | awk 'NR > 1 && NF > 0 {print $1}')
+  if [[ "${#models[@]}" -eq 0 ]]; then
+    log "No installed Ollama models were found."
+    return 0
+  fi
+
+  printf '\n'
+  log "Refreshing ${#models[@]} installed Ollama model(s)"
+  for model in "${models[@]}"; do
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      log "Dry run: would run ollama pull $model"
+    else
+      run_cmd "Refreshing Ollama model: $model" ollama pull "$model"
+    fi
+  done
+}
+
+podman_as() {
+  local owner="$1"
+  shift
+
+  if [[ "$owner" == "root" ]]; then
+    podman "$@"
+  else
+    local uid
+    uid="$(id -u "$owner")"
+    runuser -u "$owner" -- env \
+      XDG_RUNTIME_DIR="/run/user/$uid" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+      podman "$@"
+  fi
+}
+
+find_open_webui_owner() {
+  if podman container exists "$OPEN_WEBUI_CONTAINER" 2>/dev/null; then
+    printf '%s\n' root
+    return 0
+  fi
+
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] && \
+    podman_as "$SUDO_USER" container exists "$OPEN_WEBUI_CONTAINER" 2>/dev/null; then
+    printf '%s\n' "$SUDO_USER"
+    return 0
+  fi
+
+  return 1
+}
+
+update_open_webui() {
+  local owner=""
+  local image=""
+  local old_image_id=""
+  local new_image_id=""
+  local backup_file=""
+
+  if [[ "$UPDATE_OPEN_WEBUI" -ne 1 ]]; then
+    log "Skipping Open WebUI update by request."
+    return 0
+  fi
+
+  if ! command -v podman >/dev/null 2>&1; then
+    log "Podman is not installed; skipping Open WebUI update."
+    return 0
+  fi
+
+  if ! owner="$(find_open_webui_owner)"; then
+    log "No Podman container named '$OPEN_WEBUI_CONTAINER' was found; skipping Open WebUI update."
+    return 0
+  fi
+
+  image="$(podman_as "$owner" inspect --format '{{.Config.Image}}' "$OPEN_WEBUI_CONTAINER" 2>/dev/null || true)"
+  if [[ -z "$image" || "$image" == "<none>" ]]; then
+    image="ghcr.io/open-webui/open-webui:main"
+  fi
+
+  old_image_id="$(podman_as "$owner" inspect --format '{{.Image}}' "$OPEN_WEBUI_CONTAINER")"
+  printf '\n'
+  log "Checking Open WebUI image as Podman user: $owner"
+  log "Open WebUI image: $image"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "Dry run: would pull $image and recreate $OPEN_WEBUI_CONTAINER if its image changed."
+    return 0
+  fi
+
+  run_cmd "Pulling the current Open WebUI image" podman_as "$owner" pull "$image"
+  new_image_id="$(podman_as "$owner" image inspect --format '{{.Id}}' "$image")"
+
+  if [[ "$old_image_id" == "$new_image_id" ]]; then
+    log "Open WebUI is already current."
+    return 0
+  fi
+
+  backup_file="${LOG_FILE%.log}-open-webui-inspect.json"
+  podman_as "$owner" inspect "$OPEN_WEBUI_CONTAINER" > "$backup_file"
+  log "Saved the prior container configuration to $backup_file"
+
+  if podman_as "$owner" container clone --help >/dev/null 2>&1; then
+    run_cmd "Recreating Open WebUI with the new image" \
+      podman_as "$owner" container clone --destroy --force --run \
+      --name "$OPEN_WEBUI_CONTAINER" "$OPEN_WEBUI_CONTAINER" "$image"
+  else
+    log "The installed Podman version lacks 'container clone'. The new image was pulled,"
+    log "but the running Open WebUI container was not replaced automatically."
+    return 0
+  fi
+
+  if podman_as "$owner" container inspect --format '{{.State.Running}}' "$OPEN_WEBUI_CONTAINER" | grep -qx true; then
+    log "Open WebUI was updated and is running."
+  else
+    die "Open WebUI was recreated but is not running. Review: podman logs $OPEN_WEBUI_CONTAINER"
+  fi
+}
+
+update_ai_components() {
+  if [[ "$UPDATE_AI" -ne 1 ]]; then
+    log "Skipping local AI updates by request."
+    return 0
+  fi
+
+  update_ollama
+  update_ollama_models
+  update_open_webui
+}
+
 check_reboot_status() {
   if [[ "$CHECK_REBOOT" -ne 1 ]]; then
     return 0
@@ -301,6 +494,15 @@ while [[ $# -gt 0 ]]; do
     --no-reboot-check)
       CHECK_REBOOT=0
       ;;
+    --skip-ai)
+      UPDATE_AI=0
+      ;;
+    --skip-models)
+      UPDATE_OLLAMA_MODELS=0
+      ;;
+    --skip-open-webui)
+      UPDATE_OPEN_WEBUI=0
+      ;;
     -h|--help)
       usage
       exit 0
@@ -317,7 +519,7 @@ normalize_verbose
 
 if [[ "${EUID}" -ne 0 ]]; then
   command -v sudo >/dev/null 2>&1 || die "sudo is required when running as a non-root user."
-  exec sudo --preserve-env=LOG_DIR,VERBOSE "$0" "${ORIGINAL_ARGS[@]}"
+  exec sudo --preserve-env=LOG_DIR,VERBOSE,OPEN_WEBUI_CONTAINER "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
 setup_logging
@@ -358,6 +560,8 @@ case "$PACKAGE_FAMILY" in
     die "Unsupported package family: $PACKAGE_FAMILY"
     ;;
 esac
+
+update_ai_components
 
 check_reboot_status
 
