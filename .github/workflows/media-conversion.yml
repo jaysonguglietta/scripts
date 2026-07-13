@@ -1,0 +1,25 @@
+name: Media conversion checks
+
+on:
+  push:
+    paths:
+      - "MediaConversion/**"
+      - ".github/workflows/media-conversion.yml"
+  pull_request:
+    paths:
+      - "MediaConversion/**"
+      - ".github/workflows/media-conversion.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install checks
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - name: Check Bash syntax
+        run: bash -n MediaConversion/convert.sh MediaConversion/lib/*.sh MediaConversion/tests/run.sh MediaConversion/tests/mocks/*
+      - name: Run ShellCheck
+        run: shellcheck -x MediaConversion/convert.sh MediaConversion/lib/*.sh MediaConversion/tests/run.sh MediaConversion/tests/mocks/*
+      - name: Run tests
+        run: bash MediaConversion/tests/run.sh

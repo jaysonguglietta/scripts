@@ -1,0 +1,10 @@
+.DS_Store
+**/.DS_Store
+
+# Runtime artifacts created beside media files.
+*.convert.lock/
+.*.convert.*/
+*.part.mp4
+omdb_tagging_log.csv
+omdb_tagging_log.csv.lock
+omdb_tagging_log.csv.lock.d/

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -u
+
+arguments="$*"
+output=""
+for argument in "$@"; do
+  output="$argument"
+done
+
+if [[ -n "${MOCK_FFMPEG_LOG:-}" ]]; then
+  printf '%s\n' "$arguments" >> "$MOCK_FFMPEG_LOG"
+fi
+
+if [[ -n "${MOCK_FFMPEG_SLEEP:-}" ]]; then
+  sleep "$MOCK_FFMPEG_SLEEP"
+fi
+
+if [[ "${MOCK_QSV_FAIL:-0}" == "1" && "$arguments" == *hevc_qsv* ]]; then
+  printf '%s\n' 'mock QSV failure' >&2
+  exit 1
+fi
+
+if [[ "${MOCK_TAG_FAIL:-0}" == "1" && "$arguments" == *'-metadata title='* ]]; then
+  printf '%s\n' 'mock metadata tagging failure' >&2
+  exit 1
+fi
+
+if [[ "$arguments" == *fail.mkv* && "$output" == *.mp4 ]]; then
+  printf '%s\n' 'mock encoding failure' >&2
+  exit 1
+fi
+
+if [[ "$arguments" == *nonmonot-old.mkv* && "$arguments" == *'-c:v copy'* ]]; then
+  printf '%s\n' 'Non-monotonous DTS in output stream 0:0' >&2
+fi
+
+if [[ "$arguments" == *nonmonot-new.mkv* && "$arguments" == *'-c:v copy'* ]]; then
+  printf '%s\n' 'Non-monotonic DTS; previous: 100, current: 99' >&2
+fi
+
+if [[ "$output" == -* || -z "$output" ]]; then
+  printf '%s\n' 'mock ffmpeg could not determine output path' >&2
+  exit 2
+fi
+
+printf '%s\n' 'mock-media-payload' > "$output"

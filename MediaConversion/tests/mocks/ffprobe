@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -u
+
+arguments="$*"
+input=""
+for argument in "$@"; do
+  input="$argument"
+done
+base="$(basename "$input")"
+
+if [[ "$arguments" == *'stream=index,codec_name,channels:stream_disposition'* ]]; then
+  case "$base" in
+    commentary.mkv)
+      printf '%s\n' \
+        '1|aac|8|1|1|0|0|0|eng|Director Commentary' \
+        '2|ac3|6|0|0|0|0|0|eng|Main Feature'
+      ;;
+    und-audio.mkv)
+      printf '%s\n' '1|aac|2|1|0|0|0|0|und|Main Audio'
+      ;;
+    no-audio.mkv)
+      printf '%s\n' '1|aac|2|1|0|0|0|0|fra|French Audio'
+      ;;
+    *)
+      printf '%s\n' '1|aac|2|1|0|0|0|0|eng|Main Audio'
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$arguments" == *'stream=index,codec_name,channels'* ]]; then
+  printf '%s\n' '1,aac,2'
+  exit 0
+fi
+
+if [[ "$arguments" == *'stream=index:stream_tags=language'* ]]; then
+  case "$base" in
+    und-audio.mkv) printf '%s\n' '1,und' ;;
+    *) printf '%s\n' '1,eng' ;;
+  esac
+  exit 0
+fi
+
+if [[ "$arguments" == *'stream_disposition=forced:stream_tags=language,title'* ]]; then
+  case "$base" in
+    en-sub.mkv) printf '%s\n' '1|en|English Forced' ;;
+    title-sub.mkv) printf '%s\n' '0|und|English Forced' ;;
+    image-sub.mkv) printf '%s\n' '1|eng|English Forced PGS' ;;
+    *) : ;;
+  esac
+  exit 0
+fi
+
+if [[ "$arguments" == *'-select_streams s'* && "$arguments" == *'stream=codec_name'* ]]; then
+  case "$base" in
+    image-sub.mkv) printf '%s\n' hdmv_pgs_sub ;;
+    *) printf '%s\n' subrip ;;
+  esac
+  exit 0
+fi
+
+if [[ "$arguments" == *'-select_streams v:0'* && "$arguments" == *'stream=codec_name'* ]]; then
+  printf '%s\n' h264
+  exit 0
+fi
+
+if [[ "$arguments" == *'format=duration'* ]]; then
+  printf '%s\n' '60.000000'
+  exit 0
+fi
+
+if [[ "$arguments" == *'-show_entries stream=index'* ]]; then
+  printf '%s\n' 0
+  exit 0
+fi
+
+if [[ "$input" == *.mp4 && ! -s "$input" ]]; then
+  exit 1
+fi
+exit 0
