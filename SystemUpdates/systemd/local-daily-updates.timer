@@ -1,0 +1,13 @@
+[Unit]
+Description=Run operating-system and Local LLM maintenance every day
+Documentation=https://github.com/jaysonguglietta/scripts/tree/main/SystemUpdates
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=1m
+Unit=local-daily-updates.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+# Never commit a real Open WebUI secret file.
+quadlet/open-webui.env
+
+# Local operational output.
+*.log
+*.backup
+*.bak
