@@ -170,6 +170,7 @@ save_empty_metadata_if_missing() {
 
 omdb_automatic_lookup_and_save() {
   local base="$1" output="$2" json
+  log_info "Fetching OMDb metadata for ${base}"
   if ! json="$(omdb_lookup "$base")"; then
     log_warn "OMDb lookup failed; preserving existing metadata for ${base}."
     save_empty_metadata_if_missing "$output"
@@ -178,6 +179,11 @@ omdb_automatic_lookup_and_save() {
   if ! write_json_atomically "$output" "$json"; then
     log_warn "OMDb returned invalid JSON; preserving existing metadata for ${base}."
     return 0
+  fi
+  if [[ "$(printf '%s' "$json" | jq -r '.Response // "False"' 2>/dev/null || printf False)" == "True" ]]; then
+    log_info "Saved OMDb match to $(basename "$output")"
+  else
+    log_info "OMDb returned no confirmed match for ${base}"
   fi
 }
 
@@ -193,15 +199,18 @@ omdb_interactive_verify_and_save() {
   fi
 
   if [[ "$OMDB_ENABLED" != "1" ]]; then
+    log_info "OMDb lookup skipped for ${base}; OMDb is disabled."
     save_empty_metadata_if_missing "$output_json"
     return 0
   fi
 
   if [[ "$OMDB_INTERACTIVE" != "1" || ( ! -t 0 && ! -r /dev/tty ) ]]; then
+    log_info "Using automatic OMDb lookup for ${base}"
     omdb_automatic_lookup_and_save "$base" "$output_json"
     return 0
   fi
 
+  log_info "Fetching OMDb metadata for ${base}"
   if ! json="$(omdb_lookup "$base")"; then
     log_warn "OMDb lookup failed; preserving existing metadata for ${filepath}."
     save_empty_metadata_if_missing "$output_json"
@@ -515,6 +524,7 @@ tag_media_from_omdb() {
   local mp4="$1" work_directory="$2" sidecar json staged_mp4
   sidecar="${mp4%.*}.omdb.json"
   if ! json_is_confirmed_match "$sidecar"; then
+    log_info "Skipping MP4 metadata tagging for $(basename "$mp4"); no confirmed OMDb sidecar."
     log_omdb "$mp4" no no '' '' '' '' '' '' '' 'OMDb no match'
     return 0
   fi
@@ -592,5 +602,10 @@ tag_media_from_omdb() {
   fi
 
   log_omdb "$mp4" yes "$tagged" "$type" "$title" "$year" "$imdb_id" "$season" "$episode" "$poster" "$notes"
+  if [[ "$tagged" == yes ]]; then
+    log_info "Tagged MP4 metadata for $(basename "$mp4")"
+  else
+    log_warn "OMDb metadata was found for $(basename "$mp4"), but tagging did not complete."
+  fi
   [[ "$tagged" == yes ]]
 }

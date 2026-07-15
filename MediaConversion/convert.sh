@@ -477,13 +477,11 @@ process_one() (
 
   local input_sidecar="${input%.*}.omdb.json"
   copy_omdb_sidecar_for_output "$input_sidecar" "$output" || log_warn "Could not copy metadata sidecar for ${output}."
-  if json_is_confirmed_match "${output%.*}.omdb.json"; then
-    if ! tag_media_from_omdb "$output" "$work_directory"; then
-      log_warn "Metadata tagging failed: ${output}"
-      [[ "$STRICT_TAGGING" == "1" ]] && return 1
-    fi
-    validate_media_output "$output" "$input" || return 1
+  if ! tag_media_from_omdb "$output" "$work_directory"; then
+    log_warn "Metadata tagging failed: ${output}"
+    [[ "$STRICT_TAGGING" == "1" ]] && return 1
   fi
+  validate_media_output "$output" "$input" || return 1
 
   if [[ -n "$LAST_SIZE_CAP_BYTES" ]]; then
     actual_size="$(file_size_bytes "$output" 2>/dev/null || printf 0)"
