@@ -21,6 +21,7 @@
 - Retries oversized encoded output at a reduced bitrate.
 - Reuses confirmed OMDb sidecars and writes new sidecars atomically.
 - Tags metadata without replacing the finished MP4 unless the tagged copy validates.
+- Cleans OMDb log artifacts and sidecars after successful runs by default, while preserving failed-tagging evidence unless you opt to keep everything.
 
 ## Safety Model
 
@@ -223,6 +224,7 @@ When any size cap is active, audio is transcoded so its bitrate can be budgeted.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `OMDB_API_KEY` | empty | Required for new OMDb requests. No key is embedded. |
+| `MEDIA_CONVERSION_CONFIG` | auto | Optional config file path. When unset, the script auto-loads `media-conversion.local.env` beside `convert.sh`, then `$HOME/.config/media-conversion.env`. |
 | `OMDB_URL` | `https://www.omdbapi.com` | API endpoint. HTTPS is required when a key is set. |
 | `OMDB_INTERACTIVE` | `1` | Confirm matches when a terminal is available. |
 | `OMDB_REFRESH` | `0` | Set to `1` to refresh confirmed sidecars. |
@@ -230,15 +232,19 @@ When any size cap is active, audio is transcoded so its bitrate can be budgeted.
 | `OMDB_MAX_TIME` | `20` | Maximum request time in seconds. |
 | `OMDB_RETRIES` | `2` | Retry count for API and poster requests. |
 | `OMDB_LOG` | `omdb_tagging_log.csv` | Metadata result log. |
-| `OMDB_LOG_LOCK` | `<log>.lock` | Lock file used for parallel log writes. |
+| `OMDB_LOG_LOCK` | `<log>.lock` | Legacy lock-file path used only by the portable fallback locker. |
+| `KEEP_OMDB_SOURCE_SIDECAR` | `0` | Keep `<input>.omdb.json` after conversion. Successful tagged runs remove it by default. |
+| `KEEP_OMDB_OUTPUT_SIDECAR` | `0` | Keep `<output>.omdb.json` after conversion. Duplicate output sidecars are removed by default. |
+| `KEEP_OMDB_LOG` | `0` | Keep `OMDB_LOG` after a fully successful batch. Failed batches keep the log for troubleshooting. |
 | `STRICT_TAGGING` | `0` | Set to `1` to count metadata-tagging failure as file failure. |
 
-Store the API key outside the repository in a protected environment file:
+Store the API key in a local config file that is not committed:
 
 ```bash
-mkdir -p "$HOME/.config"
-install -m 600 /dev/null "$HOME/.config/media-conversion.env"
-${EDITOR:-vi} "$HOME/.config/media-conversion.env"
+cp /etc/scripts/MediaConversion/media-conversion.local.env.example \
+  /etc/scripts/MediaConversion/media-conversion.local.env
+chmod 600 /etc/scripts/MediaConversion/media-conversion.local.env
+${EDITOR:-vi} /etc/scripts/MediaConversion/media-conversion.local.env
 ```
 
 Example file content:
@@ -248,20 +254,32 @@ OMDB_API_KEY=replace_with_your_key
 OMDB_INTERACTIVE=0
 ```
 
-Load it before running:
+The script loads that file automatically on startup, so you can just run:
 
 ```bash
-set -a
-source "$HOME/.config/media-conversion.env"
-set +a
 /etc/scripts/MediaConversion/convert.sh
+```
+
+If you prefer a different location, point the script at it explicitly:
+
+```bash
+MEDIA_CONVERSION_CONFIG=/secure/path/media-conversion.env \
+  /etc/scripts/MediaConversion/convert.sh
 ```
 
 The key is sent through standard input to `curl`, so it is not included in `curl` process arguments. Do not enable shell tracing while manually exporting secrets.
 
-Confirmed `<input>.omdb.json` sidecars are reused unless refresh is requested. Network failures preserve valid existing metadata. Rejected matches are replaced with an empty sidecar and are not silently reused. Search choices are limited to the displayed results.
+Confirmed `<input>.omdb.json` sidecars are reused unless refresh is requested and unless cleanup removes them after a successful run. Network failures preserve valid existing metadata. Rejected matches are replaced with an empty sidecar and are not silently reused. Search choices are limited to the displayed results.
 
 Tagging is staged on a copy. AtomicParsley is preferred; if it fails, the original staged file is restored and FFmpeg is tried. A tagged file must pass stream and duration validation before it can replace the untagged MP4.
+
+If you prefer a persistent metadata cache and audit trail, set:
+
+```bash
+KEEP_OMDB_SOURCE_SIDECAR=1
+KEEP_OMDB_OUTPUT_SIDECAR=1
+KEEP_OMDB_LOG=1
+```
 
 ## Output Validation
 

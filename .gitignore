@@ -8,3 +8,4 @@
 omdb_tagging_log.csv
 omdb_tagging_log.csv.lock
 omdb_tagging_log.csv.lock.d/
+MediaConversion/media-conversion.local.env

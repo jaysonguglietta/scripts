@@ -367,6 +367,54 @@ copy_omdb_sidecar_for_output() {
   fi
 }
 
+cleanup_omdb_file_artifacts() {
+  local input="$1" output="$2" tagging_succeeded="${3:-0}" confirmed_match="${4:-0}"
+  local source_sidecar="${input%.*}.omdb.json"
+  local output_sidecar="${output%.*}.omdb.json"
+
+  if [[ "$source_sidecar" == "$output_sidecar" ]]; then
+    if [[ "$KEEP_OMDB_SOURCE_SIDECAR" == "1" || "$KEEP_OMDB_OUTPUT_SIDECAR" == "1" ]]; then
+      return 0
+    fi
+    if [[ -f "$source_sidecar" && ( "$tagging_succeeded" == "1" || "$confirmed_match" != "1" ) ]]; then
+      rm -f -- "$source_sidecar" || return 1
+      log_info "Removed OMDb sidecar: $(basename "$source_sidecar")"
+    fi
+    return 0
+  fi
+
+  if [[ "$KEEP_OMDB_OUTPUT_SIDECAR" != "1" && -f "$output_sidecar" ]]; then
+    rm -f -- "$output_sidecar" || return 1
+    log_info "Removed output OMDb sidecar: $(basename "$output_sidecar")"
+  fi
+
+  if [[ "$KEEP_OMDB_SOURCE_SIDECAR" != "1" && -f "$source_sidecar" && ( "$tagging_succeeded" == "1" || "$confirmed_match" != "1" ) ]]; then
+    rm -f -- "$source_sidecar" || return 1
+    log_info "Removed source OMDb sidecar: $(basename "$source_sidecar")"
+  fi
+}
+
+cleanup_omdb_run_artifacts() {
+  local failures="${1:-0}"
+  local removed_log=0
+
+  if [[ "$KEEP_OMDB_LOG" != "1" && "$failures" == "0" && -f "$OMDB_LOG" ]]; then
+    rm -f -- "$OMDB_LOG" || return 1
+    removed_log=1
+  fi
+
+  if [[ -f "$OMDB_LOG_LOCK" ]]; then
+    rm -f -- "$OMDB_LOG_LOCK" || return 1
+  fi
+  if [[ -d "${OMDB_LOG_LOCK}.d" ]]; then
+    rmdir -- "${OMDB_LOG_LOCK}.d" 2>/dev/null || true
+  fi
+
+  if (( removed_log == 1 )); then
+    log_info "Removed OMDb metadata log: ${OMDB_LOG}"
+  fi
+}
+
 ensure_omdb_log_header() {
   if [[ ! -f "$OMDB_LOG" ]]; then
     printf '%s\n' 'file,matched,tagged,type,title,year,imdbID,season,episode,poster_url,notes' > "$OMDB_LOG"
@@ -378,9 +426,11 @@ append_omdb_log_line() {
   if command -v flock >/dev/null 2>&1; then
     (
       flock -x 9
-      ensure_omdb_log_header
-      printf '%s\n' "$line" >> "$OMDB_LOG"
-    ) 9>>"$OMDB_LOG_LOCK"
+      if [[ ! -s "$OMDB_LOG" ]]; then
+        printf '%s\n' 'file,matched,tagged,type,title,year,imdbID,season,episode,poster_url,notes' >&9
+      fi
+      printf '%s\n' "$line" >&9
+    ) 9>>"$OMDB_LOG"
     return
   fi
 

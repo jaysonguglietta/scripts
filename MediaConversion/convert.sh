@@ -28,6 +28,17 @@ JOBS_CLI=""
 OMDB_REFRESH_CLI=""
 STRICT_SIZE_CLI=""
 
+CONFIG_VARIABLES=(
+  FFMPEG FFPROBE JOBS VERBOSE
+  OMDB_API_KEY OMDB_URL OMDB_LOG OMDB_LOG_LOCK OMDB_INTERACTIVE OMDB_REFRESH OMDB_CONNECT_TIMEOUT OMDB_MAX_TIME OMDB_RETRIES
+  REPAIR_MODE SUBTITLE_MODE FAST_VIDEO_COPY KEEP_OMDB_SOURCE_SIDECAR KEEP_OMDB_OUTPUT_SIDECAR KEEP_OMDB_LOG
+  ALLOW_UNTAGGED_AUDIO_FALLBACK ALLOW_FORCED_TITLE_FALLBACK AUDIO_STREAM_INDEX FORCED_SUBTITLE_STREAM FIX_TIMESTAMPS
+  QSV_GLOBAL_QUALITY QSV_PRESET X264_CRF X264_PRESET X264_THREADS X265_CRF X265_PRESET USE_VBV VBV_MAXRATE VBV_BUFSIZE AAC_STEREO_BR AC3_51_BR
+  TV_MAX_BYTES MP4_TAG_HEADROOM_BYTES AUDIO_MODE QUALITY_ENCODE MAX_HEIGHT SIZE_SAFETY_PERCENT SIZE_RETRY_ATTEMPTS SIZE_TOLERANCE_PERCENT
+  STRICT_SIZE_CAP STRICT_TAGGING STRICT_DISK_CHECK
+)
+LOADED_CONFIG_PATH=""
+
 print_usage() {
   cat <<'EOF'
 Usage:
@@ -49,10 +60,14 @@ Options:
 
 Important environment settings:
   OMDB_API_KEY                required for new OMDb lookups; no key is embedded
+  MEDIA_CONVERSION_CONFIG     optional env-file path to auto-load before defaults
   OMDB_INTERACTIVE=0|1        verify metadata interactively (default: 1)
   REPAIR_MODE=auto|always|never
   SUBTITLE_MODE=burn|copy|extract
   FAST_VIDEO_COPY=0|1
+  KEEP_OMDB_SOURCE_SIDECAR=0|1
+  KEEP_OMDB_OUTPUT_SIDECAR=0|1
+  KEEP_OMDB_LOG=0|1
   ALLOW_UNTAGGED_AUDIO_FALLBACK=0|1
   ALLOW_FORCED_TITLE_FALLBACK=0|1
   AUDIO_STREAM_INDEX=auto|INDEX
@@ -63,6 +78,68 @@ Important environment settings:
 
 Run from the directory containing the MKV files. See README.md for all settings.
 EOF
+}
+
+load_config_file() {
+  local config_path="$1" variable had_var saved_var
+
+  for variable in "${CONFIG_VARIABLES[@]}"; do
+    had_var="CONFIG_HAD_${variable}"
+    saved_var="CONFIG_VALUE_${variable}"
+    if [[ ${!variable+x} ]]; then
+      printf -v "$had_var" '%s' 1
+      printf -v "$saved_var" '%s' "${!variable}"
+    else
+      printf -v "$had_var" '%s' 0
+      printf -v "$saved_var" '%s' ''
+    fi
+  done
+
+  set -a
+  # shellcheck source=/dev/null
+  source "$config_path"
+  set +a
+
+  for variable in "${CONFIG_VARIABLES[@]}"; do
+    had_var="CONFIG_HAD_${variable}"
+    saved_var="CONFIG_VALUE_${variable}"
+    if [[ "${!had_var}" == "1" ]]; then
+      printf -v "$variable" '%s' "${!saved_var}"
+      export "$variable"
+    fi
+    unset "$had_var" "$saved_var"
+  done
+
+  LOADED_CONFIG_PATH="$config_path"
+  log_info "Loaded config: ${config_path}"
+}
+
+load_local_config() {
+  local config_path
+  local -a candidates=()
+
+  if [[ -n "${MEDIA_CONVERSION_CONFIG:-}" ]]; then
+    candidates+=("$MEDIA_CONVERSION_CONFIG")
+  fi
+  candidates+=("${SCRIPT_DIR}/media-conversion.local.env")
+  if [[ -n "${HOME:-}" ]]; then
+    candidates+=("${HOME}/.config/media-conversion.env")
+  fi
+
+  for config_path in "${candidates[@]}"; do
+    [[ -n "$config_path" ]] || continue
+    if [[ ! -e "$config_path" ]]; then
+      continue
+    fi
+    if [[ ! -r "$config_path" ]]; then
+      log_error "Config file is not readable: ${config_path}"
+      return 1
+    fi
+    load_config_file "$config_path"
+    return 0
+  done
+
+  return 0
 }
 
 require_option_value() {
@@ -154,6 +231,9 @@ load_defaults() {
   REPAIR_MODE="${REPAIR_MODE:-auto}"
   SUBTITLE_MODE="${SUBTITLE_MODE:-burn}"
   FAST_VIDEO_COPY="${FAST_VIDEO_COPY:-1}"
+  KEEP_OMDB_SOURCE_SIDECAR="${KEEP_OMDB_SOURCE_SIDECAR:-0}"
+  KEEP_OMDB_OUTPUT_SIDECAR="${KEEP_OMDB_OUTPUT_SIDECAR:-0}"
+  KEEP_OMDB_LOG="${KEEP_OMDB_LOG:-0}"
   ALLOW_UNTAGGED_AUDIO_FALLBACK="${ALLOW_UNTAGGED_AUDIO_FALLBACK:-1}"
   ALLOW_FORCED_TITLE_FALLBACK="${ALLOW_FORCED_TITLE_FALLBACK:-1}"
   AUDIO_STREAM_INDEX="${AUDIO_STREAM_INDEX:-auto}"
@@ -209,6 +289,7 @@ validate_config() {
   local setting
   validate_positive_integer JOBS "$JOBS" || return 1
   for setting in VERBOSE OMDB_INTERACTIVE OMDB_REFRESH FAST_VIDEO_COPY \
+    KEEP_OMDB_SOURCE_SIDECAR KEEP_OMDB_OUTPUT_SIDECAR KEEP_OMDB_LOG \
     ALLOW_UNTAGGED_AUDIO_FALLBACK ALLOW_FORCED_TITLE_FALLBACK FIX_TIMESTAMPS \
     QUALITY_ENCODE USE_VBV STRICT_SIZE_CAP STRICT_TAGGING STRICT_DISK_CHECK; do
     validate_bool "$setting" "${!setting}" || return 1
@@ -354,6 +435,9 @@ print_banner() {
   printf 'Workers=%s repair=%s subtitles=%s fast-copy=%s\n' "$JOBS" "$REPAIR_MODE" "$SUBTITLE_MODE" "$FAST_VIDEO_COPY" >&2
   printf 'Audio=%s quality-encode=%s max-height=%s\n' "$AUDIO_MODE" "$QUALITY_ENCODE" "$MAX_HEIGHT" >&2
   printf 'OMDb enabled=%s interactive=%s refresh=%s\n' "$OMDB_ENABLED" "$OMDB_INTERACTIVE" "$OMDB_REFRESH" >&2
+  [[ -n "$LOADED_CONFIG_PATH" ]] && printf 'Config=%s\n' "$LOADED_CONFIG_PATH" >&2
+  printf 'Metadata cleanup source-sidecar=%s output-sidecar=%s log=%s\n' \
+    "$KEEP_OMDB_SOURCE_SIDECAR" "$KEEP_OMDB_OUTPUT_SIDECAR" "$KEEP_OMDB_LOG" >&2
   [[ -n "$TARGET_SIZE_BYTES" ]] && printf 'Target size=%s bytes\n' "$TARGET_SIZE_BYTES" >&2
   printf 'TV target=%s bytes metadata headroom=%s bytes\n' "$TV_MAX_BYTES" "$MP4_TAG_HEADROOM_BYTES" >&2
   printf '%s\n' '========================================' >&2
@@ -378,6 +462,7 @@ process_one() (
   local input="$1" output="$2"
   local work_directory="" partial="" repaired="" source="$input" convert_status=0
   local used_repaired=0 detected_type file_name actual_size retry=0 retry_bitrate=""
+  local metadata_tagged=0 metadata_confirmed=0
   WORKER_DIRECTORY=""
 
   # shellcheck disable=SC2317,SC2329 # Invoked indirectly by the EXIT trap.
@@ -477,11 +562,18 @@ process_one() (
 
   local input_sidecar="${input%.*}.omdb.json"
   copy_omdb_sidecar_for_output "$input_sidecar" "$output" || log_warn "Could not copy metadata sidecar for ${output}."
+  if json_is_confirmed_match "${output%.*}.omdb.json"; then
+    metadata_confirmed=1
+  fi
   if ! tag_media_from_omdb "$output" "$work_directory"; then
     log_warn "Metadata tagging failed: ${output}"
     [[ "$STRICT_TAGGING" == "1" ]] && return 1
+  elif [[ "$metadata_confirmed" == "1" ]]; then
+    metadata_tagged=1
   fi
   validate_media_output "$output" "$input" || return 1
+  cleanup_omdb_file_artifacts "$input" "$output" "$metadata_tagged" "$metadata_confirmed" || \
+    log_warn "Could not clean OMDb sidecars for ${output}"
 
   if [[ -n "$LAST_SIZE_CAP_BYTES" ]]; then
     actual_size="$(file_size_bytes "$output" 2>/dev/null || printf 0)"
@@ -581,6 +673,7 @@ run_conversions() {
 
 main() {
   parse_cli "$@"
+  load_local_config || exit 1
   load_defaults
   validate_config || exit 1
   initialize_runtime || exit 1
@@ -616,7 +709,12 @@ main() {
   fi
 
   run_conversions
-  printf '[ALL DONE] failures=%s metadata-log=%s\n' "$FAILURES" "$OMDB_LOG" >&2
+  cleanup_omdb_run_artifacts "$FAILURES" || log_warn 'Could not clean OMDb run artifacts.'
+  if [[ "$KEEP_OMDB_LOG" != "1" && "$FAILURES" == "0" && ! -f "$OMDB_LOG" ]]; then
+    printf '[ALL DONE] failures=%s metadata-log=cleaned\n' "$FAILURES" >&2
+  else
+    printf '[ALL DONE] failures=%s metadata-log=%s\n' "$FAILURES" "$OMDB_LOG" >&2
+  fi
   (( FAILURES == 0 ))
 }
 
