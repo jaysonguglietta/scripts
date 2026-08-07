@@ -110,11 +110,28 @@ pick_best_untagged_audio_stream_index() {
     '
 }
 
+audio_track_position_to_stream_index() {
+  local file="$1" position="$2"
+  "$FFPROBE" -v error -select_streams a \
+    -show_entries stream=index -of csv=p=0 "$file" |
+    awk -v position="$position" 'NR==position { print; exit }'
+}
+
 pick_audio_stream_index() {
-  local file="$1" index=""
-  if [[ "$AUDIO_STREAM_INDEX" != "auto" ]]; then
-    printf '%s|manual' "$AUDIO_STREAM_INDEX"
+  local file="$1" index="" audio_stream_index="${AUDIO_STREAM_INDEX:-auto}" audio_track_position="${AUDIO_TRACK_POSITION:-auto}"
+  if [[ "$audio_stream_index" != "auto" ]]; then
+    printf '%s|manual' "$audio_stream_index"
     return 0
+  fi
+
+  if [[ "$audio_track_position" != "auto" ]]; then
+    index="$(audio_track_position_to_stream_index "$file" "$audio_track_position")"
+    if [[ -n "$index" ]]; then
+      printf '%s|track' "$index"
+      return 0
+    fi
+    log_error "Requested audio track ${audio_track_position} was not found in ${file}."
+    return 1
   fi
 
   index="$(pick_best_eng_audio_stream_index "$file")"
@@ -216,8 +233,36 @@ get_video_codec_name() {
   "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$1" | head -n 1
 }
 
+get_video_pixel_format() {
+  "$FFPROBE" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$1" | head -n 1
+}
+
 video_codec_can_copy_to_mp4() {
   [[ "$1" == "h264" || "$1" == "hevc" ]]
+}
+
+qsv_skip_reason() {
+  local source="$1" codec="" pixel_format=""
+  codec="$(get_video_codec_name "$source")"
+  pixel_format="$(get_video_pixel_format "$source")"
+
+  if [[ "$codec" == "av1" ]]; then
+    printf 'Skipping Intel QSV for AV1 source (pixel format %s); using CPU x264.' "${pixel_format:-unknown}"
+    return 0
+  fi
+
+  case "$pixel_format" in
+    ''|yuv420p|yuvj420p|nv12|p010le)
+      return 1
+      ;;
+    *422*|*444*|gbr*|rgb*|gray*|ya*)
+      printf 'Skipping Intel QSV for source pixel format %s; using CPU x264.' "$pixel_format"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 repair_mkv() {
@@ -383,20 +428,24 @@ run_standard_encode() {
     return $?
   fi
 
-  log_info 'Trying Intel QSV HEVC.'
-  local -a qsv_rate=(-global_quality "$QSV_GLOBAL_QUALITY")
-  [[ -n "$video_bitrate" ]] && qsv_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k")
-  if "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
-      "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" \
-      -map 0:v:0 "${audio_arguments[@]}" \
-      "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
-      "${filter_arguments[@]+"${filter_arguments[@]}"}" \
-      -c:v hevc_qsv "${qsv_rate[@]}" -preset "$QSV_PRESET" -tag:v hvc1 \
-      "${MP4_OUTPUT_FLAGS[@]}" "$output"; then
-    return 0
+  local qsv_reason=""
+  if qsv_reason="$(qsv_skip_reason "$source")"; then
+    log_warn "$qsv_reason"
+  else
+    log_info 'Trying Intel QSV HEVC.'
+    local -a qsv_rate=(-global_quality "$QSV_GLOBAL_QUALITY")
+    [[ -n "$video_bitrate" ]] && qsv_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k")
+    if "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
+        "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" \
+        -map 0:v:0 "${audio_arguments[@]}" \
+        "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
+        "${filter_arguments[@]+"${filter_arguments[@]}"}" \
+        -c:v hevc_qsv "${qsv_rate[@]}" -preset "$QSV_PRESET" -tag:v hvc1 \
+        "${MP4_OUTPUT_FLAGS[@]}" "$output"; then
+      return 0
+    fi
+    log_warn 'QSV failed; falling back to CPU x264.'
   fi
-
-  log_warn 'QSV failed; falling back to CPU x264.'
   local -a fallback_rate=(-crf "$X264_CRF")
   [[ -n "$video_bitrate" ]] && fallback_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k" -bufsize "${VBV_BUFSIZE}k")
   "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
@@ -444,6 +493,8 @@ convert_from_source() {
     log_warn "Using untagged/undetermined audio stream 0:${audio_index}."
   elif [[ "$selected_audio_kind" == "manual" ]]; then
     log_info "Using manually selected audio stream 0:${audio_index}."
+  elif [[ "$selected_audio_kind" == "track" ]]; then
+    log_info "Using requested audio track ${AUDIO_TRACK_POSITION} (stream 0:${audio_index})."
   fi
   log_info "Audio mode=${AUDIO_MODE} stream=0:${audio_index} codec=${codec} channels=${channels} language=${audio_language:-untagged}"
   log_info "Source video codec=${video_codec:-unknown}"

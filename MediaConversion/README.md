@@ -16,7 +16,7 @@
 - Copies text subtitles, extracts bitmap subtitles, or burns compatible text subtitles.
 - Uses compatible H.264/HEVC video without re-encoding when the fast-copy path is safe.
 - Detects both common FFmpeg spellings of non-monotonic DTS warnings.
-- Tries Intel QSV HEVC, then falls back to CPU x264 if QSV is unavailable or fails.
+- Tries Intel QSV HEVC, skips incompatible AV1 and unsupported pixel formats, then falls back to CPU x264.
 - Supports software x265, downscaling, audio policies, and output size targets.
 - Retries oversized encoded output at a reduced bitrate.
 - Reuses confirmed OMDb sidecars and writes new sidecars atomically.
@@ -140,10 +140,16 @@ Fail the file if retries cannot meet the target within the configured tolerance:
 Override incorrectly tagged streams:
 
 ```bash
+./convert.sh --track 2
+```
+
+Or use the absolute FFmpeg stream index when you already know it:
+
+```bash
 ./convert.sh --audio-stream 2 --forced-subtitle-stream 0
 ```
 
-`--audio-stream` is an absolute FFmpeg stream index. `--forced-subtitle-stream` is a zero-based position among subtitle streams.
+`--track` is the 1-based audio track number among audio streams. `--audio-stream` is an absolute FFmpeg stream index. `--forced-subtitle-stream` is a zero-based position among subtitle streams.
 
 ## CLI Reference
 
@@ -152,6 +158,7 @@ Override incorrectly tagged streams:
 | `--target-size SIZE` | Best-effort final size cap such as `2GB`, `1.5GiB`, `700MB`, or raw bytes. |
 | `--max-height HEIGHT` | Downscale to at most this pixel height while preserving aspect ratio. `0` disables scaling. |
 | `--audio MODE` | `surround+stereo`, `surround`, or `stereo`. |
+| `--track N` | Select the Nth audio track, where `1` is the first audio stream. |
 | `--audio-stream INDEX` | Select an absolute audio stream index instead of automatic ranking. |
 | `--forced-subtitle-stream N` | Select a zero-based subtitle position instead of automatic forced-English detection. |
 | `--quality-encode` | Use software `libx265` before the standard encoder path. |
@@ -185,6 +192,7 @@ Options support both `--name value` and `--name=value` forms where a value is re
 | --- | --- | --- |
 | `AUDIO_MODE` | `surround+stereo` | Output `surround+stereo`, `surround`, or `stereo`. |
 | `AUDIO_STREAM_INDEX` | `auto` | Automatic selection or an absolute stream index. |
+| `AUDIO_TRACK_POSITION` | `auto` | Automatic selection or a 1-based audio track number. |
 | `ALLOW_UNTAGGED_AUDIO_FALLBACK` | `1` | Allow blank, `und`, or `unknown` audio language tags. |
 | `AAC_STEREO_BR` | `192k` | AAC stereo bitrate. |
 | `AC3_51_BR` | `640k` | AC-3 5.1 bitrate. |
@@ -226,7 +234,7 @@ When any size cap is active, audio is transcoded so its bitrate can be budgeted.
 | `OMDB_API_KEY` | empty | Required for new OMDb requests. No key is embedded. |
 | `MEDIA_CONVERSION_CONFIG` | auto | Optional config file path. When unset, the script auto-loads `media-conversion.local.env` beside `convert.sh`, then `$HOME/.config/media-conversion.env`. |
 | `OMDB_URL` | `https://www.omdbapi.com` | API endpoint. HTTPS is required when a key is set. |
-| `OMDB_INTERACTIVE` | `1` | Confirm matches when a terminal is available. |
+| `OMDB_INTERACTIVE` | `1` | Require a terminal confirmation before conversion, or set to `0` for automatic matches. |
 | `OMDB_REFRESH` | `0` | Set to `1` to refresh confirmed sidecars. |
 | `OMDB_CONNECT_TIMEOUT` | `5` | Connection timeout in seconds. |
 | `OMDB_MAX_TIME` | `20` | Maximum request time in seconds. |
@@ -251,7 +259,7 @@ Example file content:
 
 ```bash
 OMDB_API_KEY=replace_with_your_key
-OMDB_INTERACTIVE=0
+OMDB_INTERACTIVE=1
 ```
 
 The script loads that file automatically on startup, so you can just run:
@@ -269,7 +277,9 @@ MEDIA_CONVERSION_CONFIG=/secure/path/media-conversion.env \
 
 The key is sent through standard input to `curl`, so it is not included in `curl` process arguments. Do not enable shell tracing while manually exporting secrets.
 
-Confirmed `<input>.omdb.json` sidecars are reused unless refresh is requested and unless cleanup removes them after a successful run. Network failures preserve valid existing metadata. Rejected matches are replaced with an empty sidecar and are not silently reused. Search choices are limited to the displayed results.
+Confirmed `<input>.omdb.json` sidecars are reused unless refresh is requested and unless cleanup removes them after a successful run. Network failures preserve valid existing metadata. Rejected matches are replaced with an empty sidecar and are not silently reused. Interactive mode now stops before conversion if it cannot prompt, and it lets you accept the direct match, choose from alternatives, type a manual search, or skip tagging.
+
+If a previous confirmed sidecar exists and you want to re-prompt for a file, use `--refresh-metadata` or set `OMDB_REFRESH=1`.
 
 Tagging is staged on a copy. AtomicParsley is preferred; if it fails, the original staged file is restored and FFmpeg is tried. A tagged file must pass stream and duration validation before it can replace the untagged MP4.
 
@@ -305,11 +315,11 @@ ffprobe -v error -select_streams a \
   -of compact=p=0:nk=0 input.mkv
 ```
 
-Then use `--audio-stream INDEX` or enable `ALLOW_UNTAGGED_AUDIO_FALLBACK=1` if the intended track is untagged.
+Then use `--track N`, `--audio-stream INDEX`, or enable `ALLOW_UNTAGGED_AUDIO_FALLBACK=1` if the intended track is untagged.
 
 If subtitle detection is wrong, run `--print-subs-only`, inspect the subtitle streams, and use `--forced-subtitle-stream N` when needed.
 
-If QSV is unavailable, the script logs the failure and uses x264. Set `QUALITY_ENCODE=1` or `--quality-encode` to intentionally use software x265 instead.
+If QSV is unavailable, fails to initialize, or the source uses an incompatible codec or pixel format such as AV1, 4:2:2, or 4:4:4, the script logs the reason and uses x264. Set `QUALITY_ENCODE=1` or `--quality-encode` to intentionally use software x265 instead.
 
 If an output is too large, combine `--target-size`, `--max-height`, and `--audio stereo`. Increase `SIZE_RETRY_ATTEMPTS` for another bitrate correction, or add `--strict-size` for automation that must reject an oversized result.
 

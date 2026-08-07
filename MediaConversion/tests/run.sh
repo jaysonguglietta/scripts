@@ -94,6 +94,7 @@ test_subtitle_language_variants() {
 test_audio_ranking_and_und_fallback() {
   FFPROBE="${MOCK_BIN}/ffprobe"
   AUDIO_STREAM_INDEX=auto
+  AUDIO_TRACK_POSITION=auto
   ALLOW_UNTAGGED_AUDIO_FALLBACK=1
   assert_equal '2|english' "$(pick_audio_stream_index "${TEST_ROOT}/commentary.mkv")" 'main audio beats commentary'
   assert_equal '1|untagged' "$(pick_audio_stream_index "${TEST_ROOT}/und-audio.mkv")" 'und audio fallback'
@@ -102,6 +103,7 @@ test_audio_ranking_and_und_fallback() {
 test_missing_eligible_audio_fails_closed() {
   FFPROBE="${MOCK_BIN}/ffprobe"
   AUDIO_STREAM_INDEX=auto
+  AUDIO_TRACK_POSITION=auto
   ALLOW_UNTAGGED_AUDIO_FALLBACK=1
   ! pick_audio_stream_index "${TEST_ROOT}/no-audio.mkv" >/dev/null
 }
@@ -138,7 +140,14 @@ test_rejected_omdb_match_is_not_saved() {
   OMDB_INTERACTIVE=1
   omdb_lookup() { printf '%s' '{"Response":"True","Title":"Wrong","Year":"2020","Type":"movie","imdbID":"tt1"}'; }
   omdb_search() { printf '%s' '{"Response":"False","totalResults":"0"}'; }
-  omdb_prompt_read() { printf -v "$2" '%s' n; }
+  omdb_prompt_available() { return 0; }
+  omdb_prompt_read() {
+    case "$1" in
+      'Accept this match?'*) printf -v "$2" '%s' n ;;
+      'Search OMDb for'*) printf -v "$2" '%s' 0 ;;
+      *) return 1 ;;
+    esac
+  }
   omdb_interactive_verify_and_save "$input" >/dev/null
   assert_file_exists "$sidecar"
   assert_equal False "$(jq -r '.Response // "False"' "$sidecar")" 'rejected match should be empty'

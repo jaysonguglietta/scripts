@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-08-07
+
+### Metadata Matching
+
+- Made interactive OMDb confirmation strict by default: conversion now stops if confirmation cannot be completed while `OMDB_INTERACTIVE=1`.
+- Added a richer OMDb selection flow so operators can accept the first match, browse alternatives, run a manual search, or skip metadata before conversion starts.
+- Documented how to force a fresh metadata prompt with `--refresh-metadata` or `OMDB_REFRESH=1`.
+
+### Audio And Encoding
+
+- Added `--track N` and `AUDIO_TRACK_POSITION` to select the Nth audio track when the preferred English stream is not the first audio stream.
+- Preflight Intel QSV eligibility and skip it cleanly for AV1 or unsupported pixel formats before falling back to CPU x264.
+
+### Documentation
+
+- Updated the operator guide and sample config to reflect the new metadata-confirmation default, audio-track override, and encoder fallback behavior.
+
 ## 2026-07-13
 
 ### Safety And Reliability

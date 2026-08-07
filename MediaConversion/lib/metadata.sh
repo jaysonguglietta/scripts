@@ -25,6 +25,10 @@ clean_title() {
   printf '%s' "$value" | sed -E 's/[[:space:]]+/ /g; s/^[[:space:]]+|[[:space:]]+$//g'
 }
 
+trim_whitespace() {
+  printf '%s' "${1:-}" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g'
+}
+
 parse_sxxexx() {
   local value="$1"
   value="$(printf '%s' "$value" | sed -E 's/[._-]+/ /g')"
@@ -162,6 +166,85 @@ omdb_prompt_read() {
   return 1
 }
 
+omdb_prompt_available() {
+  [[ -t 0 ]] || [[ -r /dev/tty && -w /dev/tty ]]
+}
+
+omdb_search_and_select() {
+  local filepath="$1" output="$2" initial_query="$3"
+  local search_query="$initial_query" search_json total shown choice selected_id selected_json
+
+  while :; do
+    if [[ -z "$search_query" ]]; then
+      if ! omdb_prompt_read 'Search OMDb for (enter 0 to skip): ' search_query; then
+        log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."
+        return 1
+      fi
+      search_query="$(trim_whitespace "$search_query")"
+      if [[ "$search_query" == "0" ]]; then
+        write_json_atomically "$output" '{}'
+        return 0
+      fi
+      if [[ -z "$search_query" ]]; then
+        printf 'Please enter a search query or 0 to skip.\n'
+        continue
+      fi
+    fi
+
+    log_info "Searching OMDb for ${search_query}"
+    if ! search_json="$(omdb_search "$search_query")"; then
+      log_warn "OMDb search failed for ${search_query}."
+      search_query=""
+      continue
+    fi
+
+    total="$(printf '%s' "$search_json" | jq -r '.totalResults // 0' 2>/dev/null || printf 0)"
+    if [[ "$total" == "0" ]]; then
+      printf '\nNo OMDb results for: %s\n\n' "$search_query"
+      search_query=""
+      continue
+    fi
+
+    shown="$total"
+    (( shown > 8 )) && shown=8
+    printf '\nAlternatives for "%s":\n----------------------------------------\n' "$search_query"
+    printf '%s' "$search_json" | jq -r '.Search[] | "\(.Title) | \(.Year) | \(.imdbID) | \(.Type)"' | nl -w2 -s'. ' | sed -n "1,${shown}p"
+    printf '%s\n' '----------------------------------------'
+
+    while :; do
+      if ! omdb_prompt_read "Choice [1-${shown}], (m)anual search, or 0 to skip: " choice; then
+        log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."
+        return 1
+      fi
+      case "$(lowercase "$choice")" in
+        0)
+          write_json_atomically "$output" '{}'
+          return 0
+          ;;
+        m|manual)
+          search_query=""
+          break
+          ;;
+        *)
+          if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( choice <= shown )); then
+            selected_id="$(printf '%s' "$search_json" | jq -r ".Search[$((choice - 1))].imdbID // empty")"
+            if [[ -z "$selected_id" ]]; then
+              printf 'Could not read that selection. Choose another result, press m, or enter 0.\n'
+              continue
+            fi
+            if selected_json="$(omdb_fetch_by_id "$selected_id")" && write_json_atomically "$output" "$selected_json"; then
+              return 0
+            fi
+            printf 'Could not fetch that selection. Choose another result, press m, or enter 0.\n'
+          else
+            printf 'Choose a displayed number, m, or 0.\n'
+          fi
+          ;;
+      esac
+    done
+  done
+}
+
 save_empty_metadata_if_missing() {
   local output="$1"
   [[ -e "$output" ]] && return 0
@@ -188,7 +271,7 @@ omdb_automatic_lookup_and_save() {
 }
 
 omdb_interactive_verify_and_save() {
-  local filepath="$1" base output_json json response answer
+  local filepath="$1" base output_json json response answer cleaned search_query
   base="$(basename "$filepath")"
   base="${base%.*}"
   output_json="${filepath%.*}.omdb.json"
@@ -204,10 +287,15 @@ omdb_interactive_verify_and_save() {
     return 0
   fi
 
-  if [[ "$OMDB_INTERACTIVE" != "1" || ( ! -t 0 && ! -r /dev/tty ) ]]; then
+  if [[ "$OMDB_INTERACTIVE" != "1" ]]; then
     log_info "Using automatic OMDb lookup for ${base}"
     omdb_automatic_lookup_and_save "$base" "$output_json"
     return 0
+  fi
+
+  if ! omdb_prompt_available; then
+    log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."
+    return 1
   fi
 
   log_info "Fetching OMDb metadata for ${base}"
@@ -225,10 +313,9 @@ omdb_interactive_verify_and_save() {
       "$(printf '%s' "$json" | jq -r '.Type // ""')" \
       "$(printf '%s' "$json" | jq -r '.imdbID // ""')"
     while :; do
-      if ! omdb_prompt_read 'Is this match correct? (y)es / (n)o / (s)earch alternatives / (k)skip: ' answer; then
-        log_warn "Prompt unavailable; preserving the automatic match for ${filepath}."
-        write_json_atomically "$output_json" "$json"
-        return 0
+      if ! omdb_prompt_read 'Accept this match? (y)es / (n)o, show alternatives / (m)anual search / (k)skip: ' answer; then
+        log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."
+        return 1
       fi
       case "$(lowercase "$answer")" in
         y|yes)
@@ -236,58 +323,26 @@ omdb_interactive_verify_and_save() {
           return 0
           ;;
         n|no|s)
-          # The direct match was explicitly rejected and must never be reused.
-          json=""
+          search_query="$(clean_title "$base")"
+          break
+          ;;
+        m|manual)
+          search_query=""
           break
           ;;
         k|skip)
           write_json_atomically "$output_json" '{}'
           return 0
           ;;
-        *) printf 'Please answer y, n, s, or k.\n' ;;
+        *) printf 'Please answer y, n, m, or k.\n' ;;
       esac
     done
+  else
+    log_info "No direct OMDb match confirmed for ${base}; choose a result or skip."
+    search_query="$(clean_title "$base")"
   fi
 
-  local cleaned search_json total shown choice selected_id selected_json
-  cleaned="$(clean_title "$base")"
-  if ! search_json="$(omdb_search "$cleaned")"; then
-    log_warn "OMDb alternative search failed; preserving existing metadata for ${filepath}."
-    save_empty_metadata_if_missing "$output_json"
-    return 0
-  fi
-  total="$(printf '%s' "$search_json" | jq -r '.totalResults // 0' 2>/dev/null || printf 0)"
-  if [[ "$total" == "0" ]]; then
-    log_info "No OMDb alternatives found for ${filepath}."
-    write_json_atomically "$output_json" '{}'
-    return 0
-  fi
-
-  shown="$total"
-  (( shown > 8 )) && shown=8
-  printf '\nAlternatives:\n----------------------------------------\n'
-  printf '%s' "$search_json" | jq -r '.Search[] | "\(.Title) | \(.Year) | \(.imdbID) | \(.Type)"' | nl -w2 -s'. ' | sed -n "1,${shown}p"
-  printf '%s\n' '----------------------------------------'
-
-  while :; do
-    if ! omdb_prompt_read "Choice [0-${shown}, 0 skips]: " choice; then
-      write_json_atomically "$output_json" '{}'
-      return 0
-    fi
-    if [[ "$choice" == "0" ]]; then
-      write_json_atomically "$output_json" '{}'
-      return 0
-    fi
-    if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && (( choice <= shown )); then
-      selected_id="$(printf '%s' "$search_json" | jq -r ".Search[$((choice - 1))].imdbID // empty")"
-      if selected_json="$(omdb_fetch_by_id "$selected_id")" && write_json_atomically "$output_json" "$selected_json"; then
-        return 0
-      fi
-      printf 'Could not fetch that selection. Try again or enter 0.\n'
-    else
-      printf 'Choose a displayed number or 0.\n'
-    fi
-  done
+  omdb_search_and_select "$filepath" "$output_json" "$search_query"
 }
 
 format_episode_number() {

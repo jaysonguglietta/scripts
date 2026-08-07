@@ -21,6 +21,7 @@ TARGET_SIZE_SPEC=""
 MAX_HEIGHT_CLI=""
 AUDIO_MODE_CLI=""
 AUDIO_STREAM_CLI=""
+AUDIO_TRACK_CLI=""
 FORCED_SUBTITLE_STREAM_CLI=""
 QUALITY_ENCODE_CLI=""
 X265_PRESET_CLI=""
@@ -32,7 +33,7 @@ CONFIG_VARIABLES=(
   FFMPEG FFPROBE JOBS VERBOSE
   OMDB_API_KEY OMDB_URL OMDB_LOG OMDB_LOG_LOCK OMDB_INTERACTIVE OMDB_REFRESH OMDB_CONNECT_TIMEOUT OMDB_MAX_TIME OMDB_RETRIES
   REPAIR_MODE SUBTITLE_MODE FAST_VIDEO_COPY KEEP_OMDB_SOURCE_SIDECAR KEEP_OMDB_OUTPUT_SIDECAR KEEP_OMDB_LOG
-  ALLOW_UNTAGGED_AUDIO_FALLBACK ALLOW_FORCED_TITLE_FALLBACK AUDIO_STREAM_INDEX FORCED_SUBTITLE_STREAM FIX_TIMESTAMPS
+  ALLOW_UNTAGGED_AUDIO_FALLBACK ALLOW_FORCED_TITLE_FALLBACK AUDIO_STREAM_INDEX AUDIO_TRACK_POSITION FORCED_SUBTITLE_STREAM FIX_TIMESTAMPS
   QSV_GLOBAL_QUALITY QSV_PRESET X264_CRF X264_PRESET X264_THREADS X265_CRF X265_PRESET USE_VBV VBV_MAXRATE VBV_BUFSIZE AAC_STEREO_BR AC3_51_BR
   TV_MAX_BYTES MP4_TAG_HEADROOM_BYTES AUDIO_MODE QUALITY_ENCODE MAX_HEIGHT SIZE_SAFETY_PERCENT SIZE_RETRY_ATTEMPTS SIZE_TOLERANCE_PERCENT
   STRICT_SIZE_CAP STRICT_TAGGING STRICT_DISK_CHECK
@@ -49,6 +50,7 @@ Options:
   --max-height HEIGHT         downscale video to at most HEIGHT pixels
   --audio MODE                surround+stereo, surround, or stereo
   --audio-stream INDEX        use an explicit absolute audio stream index
+  --track N                   use the Nth audio track (1-based among audio streams)
   --forced-subtitle-stream N  use an explicit subtitle-relative stream position
   --quality-encode            use software HEVC for tighter compression
   --x265-preset PRESET        libx265 speed/quality preset
@@ -61,7 +63,7 @@ Options:
 Important environment settings:
   OMDB_API_KEY                required for new OMDb lookups; no key is embedded
   MEDIA_CONVERSION_CONFIG     optional env-file path to auto-load before defaults
-  OMDB_INTERACTIVE=0|1        verify metadata interactively (default: 1)
+  OMDB_INTERACTIVE=0|1        require metadata confirmation before convert (default: 1)
   REPAIR_MODE=auto|always|never
   SUBTITLE_MODE=burn|copy|extract
   FAST_VIDEO_COPY=0|1
@@ -71,6 +73,7 @@ Important environment settings:
   ALLOW_UNTAGGED_AUDIO_FALLBACK=0|1
   ALLOW_FORCED_TITLE_FALLBACK=0|1
   AUDIO_STREAM_INDEX=auto|INDEX
+  AUDIO_TRACK_POSITION=auto|N
   FORCED_SUBTITLE_STREAM=auto|POSITION
   STRICT_TAGGING=0|1
   STRICT_DISK_CHECK=0|1
@@ -185,6 +188,12 @@ parse_cli() {
         shift 2
         ;;
       --audio-stream=*) AUDIO_STREAM_CLI="${1#*=}"; shift ;;
+      --track|--Track)
+        require_option_value "$1" "${2:-}" || exit 1
+        AUDIO_TRACK_CLI="$2"
+        shift 2
+        ;;
+      --track=*|--Track=*) AUDIO_TRACK_CLI="${1#*=}"; shift ;;
       --forced-subtitle-stream)
         require_option_value "$1" "${2:-}" || exit 1
         FORCED_SUBTITLE_STREAM_CLI="$2"
@@ -237,6 +246,7 @@ load_defaults() {
   ALLOW_UNTAGGED_AUDIO_FALLBACK="${ALLOW_UNTAGGED_AUDIO_FALLBACK:-1}"
   ALLOW_FORCED_TITLE_FALLBACK="${ALLOW_FORCED_TITLE_FALLBACK:-1}"
   AUDIO_STREAM_INDEX="${AUDIO_STREAM_INDEX:-auto}"
+  AUDIO_TRACK_POSITION="${AUDIO_TRACK_POSITION:-auto}"
   FORCED_SUBTITLE_STREAM="${FORCED_SUBTITLE_STREAM:-auto}"
   FIX_TIMESTAMPS="${FIX_TIMESTAMPS:-1}"
 
@@ -269,6 +279,7 @@ load_defaults() {
   [[ -n "$MAX_HEIGHT_CLI" ]] && MAX_HEIGHT="$MAX_HEIGHT_CLI"
   [[ -n "$AUDIO_MODE_CLI" ]] && AUDIO_MODE="$AUDIO_MODE_CLI"
   [[ -n "$AUDIO_STREAM_CLI" ]] && AUDIO_STREAM_INDEX="$AUDIO_STREAM_CLI"
+  [[ -n "$AUDIO_TRACK_CLI" ]] && AUDIO_TRACK_POSITION="$AUDIO_TRACK_CLI"
   [[ -n "$FORCED_SUBTITLE_STREAM_CLI" ]] && FORCED_SUBTITLE_STREAM="$FORCED_SUBTITLE_STREAM_CLI"
   [[ -n "$QUALITY_ENCODE_CLI" ]] && QUALITY_ENCODE="$QUALITY_ENCODE_CLI"
   [[ -n "$X265_PRESET_CLI" ]] && X265_PRESET="$X265_PRESET_CLI"
@@ -281,6 +292,14 @@ validate_stream_override() {
   local name="$1" value="$2"
   if [[ "$value" != auto && ! "$value" =~ ^[0-9]+$ ]]; then
     log_error "${name} must be auto or a non-negative integer, got: ${value}"
+    return 1
+  fi
+}
+
+validate_track_override() {
+  local name="$1" value="$2"
+  if [[ "$value" != auto && ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "${name} must be auto or a positive integer, got: ${value}"
     return 1
   fi
 }
@@ -313,6 +332,7 @@ validate_config() {
   validate_kilobit_rate AAC_STEREO_BR "$AAC_STEREO_BR" || return 1
   validate_kilobit_rate AC3_51_BR "$AC3_51_BR" || return 1
   validate_stream_override AUDIO_STREAM_INDEX "$AUDIO_STREAM_INDEX" || return 1
+  validate_track_override AUDIO_TRACK_POSITION "$AUDIO_TRACK_POSITION" || return 1
   validate_stream_override FORCED_SUBTITLE_STREAM "$FORCED_SUBTITLE_STREAM" || return 1
 
   case "$REPAIR_MODE" in auto|always|never) ;; *) log_error "Invalid REPAIR_MODE: ${REPAIR_MODE}"; return 1 ;; esac
@@ -704,7 +724,10 @@ main() {
   if [[ "$OMDB_ENABLED" == "1" ]]; then
     local file
     for file in "${FILES[@]}"; do
-      omdb_interactive_verify_and_save "$file"
+      if ! omdb_interactive_verify_and_save "$file"; then
+        log_error "Metadata confirmation did not complete for ${file}; stopping before conversion."
+        exit 1
+      fi
     done
   fi
 
