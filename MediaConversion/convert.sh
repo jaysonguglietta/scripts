@@ -236,7 +236,9 @@ load_config_file() {
 
   # Settings are consumed by this shell; child media tools do not need secrets or policy values.
   for variable in "${CONFIG_VARIABLES[@]}"; do
-    [[ ${!variable+x} ]] && export -n "$variable" 2>/dev/null || true
+    if [[ ${!variable+x} ]]; then
+      export -n "${variable?}" 2>/dev/null || true
+    fi
   done
   LOADED_CONFIG_PATH="$config_path"
   log_info "Loaded config: ${config_path}"
@@ -487,7 +489,9 @@ load_defaults() {
 deexport_config_variables() {
   local variable
   for variable in "${CONFIG_VARIABLES[@]}"; do
-    [[ ${!variable+x} ]] && export -n "$variable" 2>/dev/null || true
+    if [[ ${!variable+x} ]]; then
+      export -n "${variable?}" 2>/dev/null || true
+    fi
   done
 }
 
@@ -638,6 +642,7 @@ initialize_state_directory() {
 
   if [[ -z "$OMDB_LOG" ]]; then
     OMDB_LOG="${MEDIA_STATE_DIR}/omdb-tagging-${RUN_ID}.csv"
+    # shellcheck disable=SC2034 # Read by lib/metadata.sh after this module is sourced.
     OMDB_LOG_IS_PER_RUN=1
   elif [[ "$OMDB_LOG" != /* ]]; then
     OMDB_LOG="${MEDIA_STATE_DIR}/${OMDB_LOG}"
@@ -716,6 +721,7 @@ initialize_runtime() {
     # shellcheck disable=SC2034 # Read by the media and metadata modules.
     MP4_OUTPUT_FLAGS=(-movflags +faststart)
   fi
+  # shellcheck disable=SC2034 # Read by lib/media.sh after this module is sourced.
   FFMPEG_PROGRESS_FLAGS=(-hide_banner -loglevel "$FFMPEG_LOG_LEVEL" -stats -nostdin)
 }
 

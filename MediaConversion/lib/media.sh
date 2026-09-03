@@ -376,7 +376,8 @@ build_video_filter_arg() {
 }
 
 build_bitmap_filter_arg() {
-  local forced_position="$1" filter="[0:v:0][0:s:${forced_position}]overlay=eof_action=pass:repeatlast=0"
+  local forced_position="$1"
+  local filter="[0:v:0][0:s:${forced_position}]overlay=eof_action=pass:repeatlast=0"
   if (( MAX_HEIGHT > 0 )); then
     filter+=",scale=-2:'min(${MAX_HEIGHT},ih)'"
   fi
@@ -494,7 +495,11 @@ run_standard_encode() {
   if qsv_reason="$(qsv_skip_reason "$source")"; then
     log_warn "$qsv_reason"
   else
-    [[ "$subtitle_action" == burn_* ]] && log_info 'Burning forced English subtitles through Intel QSV HEVC.' || log_info 'Trying Intel QSV HEVC.'
+    if [[ "$subtitle_action" == burn_* ]]; then
+      log_info 'Burning forced English subtitles through Intel QSV HEVC.'
+    else
+      log_info 'Trying Intel QSV HEVC.'
+    fi
     local -a qsv_rate=(-global_quality "$QSV_GLOBAL_QUALITY")
     local qsv_format
     qsv_format="$(qsv_pixel_format "$source")"

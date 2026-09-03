@@ -194,11 +194,13 @@ test_config_is_data_only_private_and_not_exported() {
   config="${directory}/media-conversion.env"
   sentinel="${directory}/executed"
   mkdir -p "$directory"
+  # shellcheck disable=SC2016 # The literal command substitution is the malicious test payload.
   printf 'OMDB_API_KEY=$(touch %s)\nJOBS=2\n' "$sentinel" > "$config"
   chmod 600 "$config"
   unset OMDB_API_KEY JOBS
   load_config_file "$config" >/dev/null || return 1
   assert_file_missing "$sentinel" || return 1
+  # shellcheck disable=SC2016 # Assert that the literal payload was parsed as data.
   [[ "$OMDB_API_KEY" == *'$(touch '* ]] || return 1
   ! env | grep -q '^OMDB_API_KEY=' || return 1
 
@@ -327,6 +329,7 @@ test_search_result_count_cannot_reach_arithmetic() {
   STRICT_METADATA=0
   OMDB_RESPONSE_MAX_BYTES=1048576
   omdb_search() {
+    # shellcheck disable=SC2016 # The literal command substitution is the malicious test payload.
     printf '{"Search":[{"Title":"Movie","Year":"2024","imdbID":"tt123","Type":"movie"}],"totalResults":"x[$(touch %s)]"}' "$sentinel"
   }
   omdb_prompt_read() { printf -v "$2" '%s' 0; }
