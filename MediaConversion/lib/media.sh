@@ -5,8 +5,12 @@
 pick_forced_eng_sub_pos() {
   local file="$1"
   if [[ "$FORCED_SUBTITLE_STREAM" != "auto" ]]; then
-    printf '%s' "$FORCED_SUBTITLE_STREAM"
-    return 0
+    if forced_eng_subtitle_position_is_allowed "$file" "$FORCED_SUBTITLE_STREAM"; then
+      printf '%s' "$FORCED_SUBTITLE_STREAM"
+      return 0
+    fi
+    log_error "Requested subtitle stream ${FORCED_SUBTITLE_STREAM} is not detected as forced English in ${file}."
+    return 1
   fi
 
   "$FFPROBE" -v error -select_streams s \
@@ -26,6 +30,31 @@ pick_forced_eng_sub_pos() {
         position++
       }
       END { if (best!=-1) print best }
+    '
+}
+
+forced_eng_subtitle_position_is_allowed() {
+  local file="$1" requested_position="$2"
+  "$FFPROBE" -v error -select_streams s \
+    -show_entries stream_disposition=forced:stream_tags=language,title \
+    -of csv=p=0:s='|' "$file" | awk -F'|' \
+      -v requested="$requested_position" \
+      -v title_fallback="${ALLOW_FORCED_TITLE_FALLBACK:-0}" \
+      -v force_selected="${FORCE_SELECTED_SUBTITLE_AS_ENGLISH:-0}" '
+      NR-1 != requested { next }
+      {
+        found=1
+        forced=$1+0
+        language=tolower($2)
+        title=tolower($3)
+        gsub(/_/, "-", language)
+        english=(language=="eng" || language=="en" || language=="english" || language ~ /^eng-/ || language ~ /^en-/)
+        title_forced=(title ~ /(^|[^[:alpha:]])forced([^[:alpha:]]|$)/)
+        title_english=(title ~ /(^|[^[:alpha:]])english([^[:alpha:]]|$)/ || title ~ /(^|[^[:alpha:]])eng([^[:alpha:]]|$)/)
+        if (!english && (language=="" || language=="und" || language=="unknown") && title_english) english=1
+        allowed=(force_selected==1 || (english && (forced==1 || (title_fallback==1 && title_forced))))
+      }
+      END { exit !(found && allowed) }
     '
 }
 
@@ -59,7 +88,7 @@ subtitle_codec_supports_mov_text() {
 pick_best_eng_audio_stream_index() {
   "$FFPROBE" -v error -select_streams a \
     -show_entries stream=index,codec_name,channels:stream_disposition=default,comment,hearing_impaired,visual_impaired,descriptions:stream_tags=language,title \
-    -of csv=p=0:s='|' "$1" | awk -F'|' '
+    -of csv=p=0:s='|' "$1" | awk -F'|' -v allow_commentary="${ALLOW_COMMENTARY_AUDIO_FALLBACK:-0}" '
       BEGIN { best_stream=""; best_score=-100000 }
       {
         stream_id=$1
@@ -76,8 +105,9 @@ pick_best_eng_audio_stream_index() {
         if (!english) next
 
         score=(channels * 10) + (is_default * 100)
-        if (is_comment || hearing || visual || descriptions) score-=1000
-        if (title ~ /commentary|audio description|descriptive|director|cast commentary|isolated score/) score-=1000
+        undesirable=(is_comment || hearing || visual || descriptions || title ~ /commentary|audio description|descriptive|director|cast commentary|isolated score/)
+        if (undesirable && allow_commentary!=1) next
+        if (undesirable) score-=1000
         if (score > best_score) { best_score=score; best_stream=stream_id }
       }
       END { if (best_stream!="") print best_stream }
@@ -87,7 +117,7 @@ pick_best_eng_audio_stream_index() {
 pick_best_untagged_audio_stream_index() {
   "$FFPROBE" -v error -select_streams a \
     -show_entries stream=index,codec_name,channels:stream_disposition=default,comment,hearing_impaired,visual_impaired,descriptions:stream_tags=language,title \
-    -of csv=p=0:s='|' "$1" | awk -F'|' '
+    -of csv=p=0:s='|' "$1" | awk -F'|' -v allow_commentary="${ALLOW_COMMENTARY_AUDIO_FALLBACK:-0}" '
       BEGIN { best_stream=""; best_score=-100000 }
       {
         stream_id=$1
@@ -102,8 +132,9 @@ pick_best_untagged_audio_stream_index() {
         if (!(language=="" || language=="und" || language=="unknown")) next
 
         score=(channels * 10) + (is_default * 100)
-        if (is_comment || hearing || visual || descriptions) score-=1000
-        if (title ~ /commentary|audio description|descriptive|director|cast commentary|isolated score/) score-=1000
+        undesirable=(is_comment || hearing || visual || descriptions || title ~ /commentary|audio description|descriptive|director|cast commentary|isolated score/)
+        if (undesirable && allow_commentary!=1) next
+        if (undesirable) score-=1000
         if (score > best_score) { best_score=score; best_stream=stream_id }
       }
       END { if (best_stream!="") print best_stream }
@@ -162,6 +193,16 @@ get_audio_codec_and_channels() {
   "$FFPROBE" -v error -select_streams a \
     -show_entries stream=index,codec_name,channels -of csv=p=0 "$file" |
     awk -F',' -v stream_id="$stream_index" '$1==stream_id { print $2 "," $3; exit }'
+}
+
+selected_audio_language_allowed() {
+  local language="$1" selection_kind="$2"
+  language_is_english "$language" && return 0
+  if language_is_untagged "$language" && [[ "${ALLOW_UNTAGGED_AUDIO_FALLBACK:-0}" == "1" ]]; then
+    return 0
+  fi
+  [[ ( "$selection_kind" == manual || "$selection_kind" == track ) && \
+    "${FORCE_SELECTED_AUDIO_AS_ENGLISH:-0}" == "1" ]]
 }
 
 build_audio_args() {
@@ -229,6 +270,12 @@ x264_extra_args() {
   (( ${#arguments[@]} > 0 )) && printf '%s\n' "${arguments[@]}"
 }
 
+x265_extra_args() {
+  local -a arguments=()
+  [[ "${X265_THREADS:-0}" != "0" ]] && arguments+=(-threads "$X265_THREADS")
+  (( ${#arguments[@]} > 0 )) && printf '%s\n' "${arguments[@]}"
+}
+
 get_video_codec_name() {
   "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$1" | head -n 1
 }
@@ -237,26 +284,43 @@ get_video_pixel_format() {
   "$FFPROBE" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$1" | head -n 1
 }
 
+get_video_color_transfer() {
+  "$FFPROBE" -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=p=0 "$1" | head -n 1
+}
+
+source_is_hdr() {
+  local transfer
+  transfer="$(get_video_color_transfer "$1" 2>/dev/null || true)"
+  [[ "$transfer" == smpte2084 || "$transfer" == arib-std-b67 ]]
+}
+
+qsv_pixel_format() {
+  local pixel_format
+  pixel_format="$(get_video_pixel_format "$1" 2>/dev/null || true)"
+  case "$pixel_format" in
+    yuv420p10le|yuv420p12le|p010le) printf p010le ;;
+    *) printf nv12 ;;
+  esac
+}
+
 video_codec_can_copy_to_mp4() {
   [[ "$1" == "h264" || "$1" == "hevc" ]]
 }
 
 qsv_skip_reason() {
-  local source="$1" codec="" pixel_format=""
-  codec="$(get_video_codec_name "$source")"
-  pixel_format="$(get_video_pixel_format "$source")"
-
-  if [[ "$codec" == "av1" ]]; then
-    printf 'Skipping Intel QSV for AV1 source (pixel format %s); using CPU x264.' "${pixel_format:-unknown}"
+  local source="$1" pixel_format=""
+  if [[ "${QSV_AVAILABLE:-0}" != "1" ]]; then
+    printf 'Intel QSV is unavailable; using a software encoder.'
     return 0
   fi
+  pixel_format="$(get_video_pixel_format "$source")"
 
   case "$pixel_format" in
-    ''|yuv420p|yuvj420p|nv12|p010le)
+    ''|yuv420p|yuvj420p|yuv420p10le|yuv420p12le|nv12|p010le)
       return 1
       ;;
     *422*|*444*|gbr*|rgb*|gray*|ya*)
-      printf 'Skipping Intel QSV for source pixel format %s; using CPU x264.' "$pixel_format"
+      printf 'Skipping Intel QSV for source pixel format %s; using a software encoder.' "$pixel_format"
       return 0
       ;;
     *)
@@ -273,7 +337,7 @@ repair_mkv() {
     fi
     log_warn 'mkvmerge repair failed; trying FFmpeg remux repair.'
   fi
-  "$FFMPEG" -y -fflags +discardcorrupt -err_detect ignore_err \
+  "$FFMPEG" -y -nostdin -fflags +discardcorrupt -err_detect ignore_err \
     -i "$input" -map 0 -c copy "$output" >"$log_file" 2>&1
 }
 
@@ -302,13 +366,21 @@ build_video_filter_arg() {
   if (( MAX_HEIGHT > 0 )); then
     filters+=("scale=-2:'min(${MAX_HEIGHT},ih)'")
   fi
-  if [[ "$subtitle_action" == "burn" ]]; then
+  if [[ "$subtitle_action" == "burn_text" ]]; then
     local escaped_source
     escaped_source="$(ffmpeg_subtitles_filter_escape "$source")"
     filters+=("subtitles='${escaped_source}':si=${forced_position}")
   fi
   local IFS=,
   printf '%s' "${filters[*]-}"
+}
+
+build_bitmap_filter_arg() {
+  local forced_position="$1" filter="[0:v:0][0:s:${forced_position}]overlay=eof_action=pass:repeatlast=0"
+  if (( MAX_HEIGHT > 0 )); then
+    filter+=",scale=-2:'min(${MAX_HEIGHT},ih)'"
+  fi
+  printf '%s[vout]' "$filter"
 }
 
 ffmpeg_subtitles_filter_escape() {
@@ -326,7 +398,7 @@ ffmpeg_subtitles_filter_escape() {
 can_use_fast_video_copy() {
   local file="$1" detected_type="$2" codec="$3" subtitle_action="$4"
   [[ "$FAST_VIDEO_COPY" == "1" ]] || return 1
-  [[ "$subtitle_action" != "burn" ]] || return 1
+  [[ "$subtitle_action" != burn_* ]] || return 1
   [[ "$QUALITY_ENCODE" != "1" ]] || return 1
   (( MAX_HEIGHT == 0 )) || return 1
   video_codec_can_copy_to_mp4 "$codec" || return 1
@@ -348,14 +420,15 @@ extract_forced_eng_subtitle() {
     mov_text|subrip) extension=srt; codec_argument=srt ;;
     webvtt) extension=vtt; codec_argument=webvtt ;;
     ass|ssa) extension=ass; codec_argument=ass ;;
+    hdmv_pgs_sub) extension=sup; codec_argument=copy ;;
     *) extension=mks; codec_argument=copy ;;
   esac
   output="${output_base}.${extension}"
   log_info "Extracting forced English subtitle to $(basename "$output")"
   if [[ "$codec_argument" == "copy" ]]; then
-    "$FFMPEG" -y -v warning -i "$file" -map "0:s:${position}" -map_metadata -1 -c:s copy "$output"
+    "$FFMPEG" -y -v warning -nostdin -i "$file" -map "0:s:${position}" -map_metadata -1 -c:s copy "$output"
   else
-    "$FFMPEG" -y -v warning -i "$file" -map "0:s:${position}" -map_metadata -1 -c:s "$codec_argument" "$output"
+    "$FFMPEG" -y -v warning -nostdin -i "$file" -map "0:s:${position}" -map_metadata -1 -c:s "$codec_argument" "$output"
   fi
   LAST_EXTRACTED_SUBTITLE="$output"
 }
@@ -379,8 +452,8 @@ calculate_video_bitrate_kbps() {
 }
 
 run_standard_encode() {
-  local source="$1" output="$2" subtitle_action="$3" video_bitrate="$4"
-  shift 4
+  local source="$1" output="$2" subtitle_action="$3" video_map="$4" video_bitrate="$5"
+  shift 5
   local audio_count="$1"
   shift
   local -a audio_arguments=("${@:1:audio_count}")
@@ -392,77 +465,76 @@ run_standard_encode() {
   local filter_count="$1"
   shift
   local -a filter_arguments=("${@:1:filter_count}")
-  local -a x264_arguments=()
+  local -a x264_arguments=() x265_arguments=()
   local argument
   while IFS= read -r argument; do
     [[ -n "$argument" ]] && x264_arguments+=("$argument")
   done < <(x264_extra_args)
+  while IFS= read -r argument; do
+    [[ -n "$argument" ]] && x265_arguments+=("$argument")
+  done < <(x265_extra_args)
 
   if [[ "$QUALITY_ENCODE" == "1" ]]; then
     log_info "Quality encode using software HEVC (${X265_PRESET})."
     local -a x265_rate=(-crf "$X265_CRF")
     [[ -n "$video_bitrate" ]] && x265_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k" -bufsize "${VBV_BUFSIZE}k")
-    if "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
+    if "$FFMPEG" -y "${FFMPEG_PROGRESS_FLAGS[@]}" "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
         "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" \
-        -map 0:v:0 "${audio_arguments[@]}" \
+        -map "$video_map" "${audio_arguments[@]}" \
         "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
         "${filter_arguments[@]+"${filter_arguments[@]}"}" \
-        -c:v libx265 "${x265_rate[@]}" -preset "$X265_PRESET" -tag:v hvc1 \
+        -c:v libx265 "${x265_rate[@]}" -preset "$X265_PRESET" "${x265_arguments[@]+"${x265_arguments[@]}"}" -tag:v hvc1 \
         "${MP4_OUTPUT_FLAGS[@]}" "$output"; then
       return 0
     fi
     log_warn 'Software HEVC failed; trying the standard encoder path.'
   fi
 
-  if [[ "$subtitle_action" == "burn" ]]; then
-    log_info 'Burning forced English subtitles with x264.'
-    local -a x264_rate=(-crf "$X264_CRF")
-    [[ -n "$video_bitrate" ]] && x264_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k" -bufsize "${VBV_BUFSIZE}k")
-    "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
-      "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" \
-      -map 0:v:0 "${audio_arguments[@]}" \
-      "${filter_arguments[@]+"${filter_arguments[@]}"}" \
-      -c:v libx264 "${x264_rate[@]}" -preset "$X264_PRESET" \
-      "${x264_arguments[@]+"${x264_arguments[@]}"}" \
-      "${MP4_OUTPUT_FLAGS[@]}" "$output"
-    return $?
-  fi
-
   local qsv_reason=""
   if qsv_reason="$(qsv_skip_reason "$source")"; then
     log_warn "$qsv_reason"
   else
-    log_info 'Trying Intel QSV HEVC.'
+    [[ "$subtitle_action" == burn_* ]] && log_info 'Burning forced English subtitles through Intel QSV HEVC.' || log_info 'Trying Intel QSV HEVC.'
     local -a qsv_rate=(-global_quality "$QSV_GLOBAL_QUALITY")
+    local qsv_format
+    qsv_format="$(qsv_pixel_format "$source")"
     [[ -n "$video_bitrate" ]] && qsv_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k")
-    if "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
+    if "$FFMPEG" -y "${FFMPEG_PROGRESS_FLAGS[@]}" "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
         "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" \
-        -map 0:v:0 "${audio_arguments[@]}" \
+        -map "$video_map" "${audio_arguments[@]}" \
         "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
         "${filter_arguments[@]+"${filter_arguments[@]}"}" \
-        -c:v hevc_qsv "${qsv_rate[@]}" -preset "$QSV_PRESET" -tag:v hvc1 \
+        -c:v hevc_qsv -pix_fmt "$qsv_format" -low_power "$QSV_LOW_POWER" "${qsv_rate[@]}" -preset "$QSV_PRESET" -tag:v hvc1 \
         "${MP4_OUTPUT_FLAGS[@]}" "$output"; then
       return 0
     fi
-    log_warn 'QSV failed; falling back to CPU x264.'
+    log_warn 'QSV failed; falling back to software encoding.'
   fi
-  local -a fallback_rate=(-crf "$X264_CRF")
-  [[ -n "$video_bitrate" ]] && fallback_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k" -bufsize "${VBV_BUFSIZE}k")
-  "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
-    "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" \
-    -map 0:v:0 "${audio_arguments[@]}" \
-    "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
-    "${filter_arguments[@]+"${filter_arguments[@]}"}" \
-    -c:v libx264 "${fallback_rate[@]}" -preset "$X264_PRESET" \
-    "${x264_arguments[@]+"${x264_arguments[@]}"}" \
-    "${MP4_OUTPUT_FLAGS[@]}" "$output"
+  if source_is_hdr "$source"; then
+    log_info 'Preserving HDR with software HEVC fallback.'
+    local -a hdr_rate=(-crf "$X265_CRF")
+    [[ -n "$video_bitrate" ]] && hdr_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k" -bufsize "${VBV_BUFSIZE}k")
+    "$FFMPEG" -y "${FFMPEG_PROGRESS_FLAGS[@]}" "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
+      "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" -map "$video_map" "${audio_arguments[@]}" \
+      "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" "${filter_arguments[@]+"${filter_arguments[@]}"}" \
+      -c:v libx265 -pix_fmt yuv420p10le "${hdr_rate[@]}" -preset "$X265_PRESET" \
+      "${x265_arguments[@]+"${x265_arguments[@]}"}" -tag:v hvc1 "${MP4_OUTPUT_FLAGS[@]}" "$output"
+  else
+    local -a fallback_rate=(-crf "$X264_CRF")
+    [[ -n "$video_bitrate" ]] && fallback_rate=(-b:v "${video_bitrate}k" -maxrate "${video_bitrate}k" -bufsize "${VBV_BUFSIZE}k")
+    "$FFMPEG" -y "${FFMPEG_PROGRESS_FLAGS[@]}" "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
+      "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" -map "$video_map" "${audio_arguments[@]}" \
+      "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" "${filter_arguments[@]+"${filter_arguments[@]}"}" \
+      -c:v libx264 -pix_fmt yuv420p "${fallback_rate[@]}" -preset "$X264_PRESET" \
+      "${x264_arguments[@]+"${x264_arguments[@]}"}" "${MP4_OUTPUT_FLAGS[@]}" "$output"
+  fi
 }
 
 convert_from_source() {
   local source="$1" output="$2" detected_type="$3" original_input="$4" work_directory="$5"
   local bitrate_override="${6:-}" force_video_encode="${7:-0}"
   local audio_index selected_audio_kind codec channels audio_language video_codec
-  local forced_position="" subtitle_codec="" subtitle_action=none video_filter=""
+  local forced_position="" subtitle_codec="" subtitle_action=none video_filter="" video_map='0:v:0'
   local size_cap_bytes video_bitrate="" fast_copy_log
   local -a audio_arguments=() subtitle_arguments=() filter_arguments=() video_copy_arguments=(-c:v copy)
 
@@ -477,10 +549,23 @@ convert_from_source() {
     log_error "No eligible English or untagged audio stream: ${original_input}"
     return 20
   fi
+  [[ "$audio_index" =~ ^[0-9]+$ ]] || { log_error 'Audio probing returned an invalid stream index.'; return 20; }
   IFS=',' read -r codec channels <<< "$(get_audio_codec_and_channels "$source" "$audio_index")"
   [[ -n "$codec" && "$channels" =~ ^[0-9]+$ ]] || { log_error "Could not inspect audio stream ${audio_index}."; return 20; }
   audio_language="$(get_audio_stream_language "$source" "$audio_index" || true)"
+  if ! selected_audio_language_allowed "$audio_language" "$selected_audio_kind"; then
+    log_error "Selected audio stream 0:${audio_index} is not tagged English (language=${audio_language:-untagged})."
+    return 20
+  elif language_is_untagged "$audio_language"; then
+    log_warn "Treating untagged selected audio stream 0:${audio_index} as English."
+  elif ! language_is_english "$audio_language"; then
+    log_warn "Overriding source language ${audio_language:-untagged} for manually selected stream 0:${audio_index}."
+  fi
   video_codec="$(get_video_codec_name "$source")"
+  if [[ "$HDR_MODE" == "reject" ]] && source_is_hdr "$source"; then
+    log_error "HDR input is rejected by HDR_MODE: ${original_input}"
+    return 21
+  fi
   size_cap_bytes="$(target_max_bytes_for_type "$detected_type")"
   # shellcheck disable=SC2034 # Read by the worker after this function returns.
   LAST_SIZE_CAP_BYTES="$size_cap_bytes"
@@ -499,16 +584,18 @@ convert_from_source() {
   log_info "Audio mode=${AUDIO_MODE} stream=0:${audio_index} codec=${codec} channels=${channels} language=${audio_language:-untagged}"
   log_info "Source video codec=${video_codec:-unknown}"
 
-  forced_position="$(pick_forced_eng_sub_pos "$source" || true)"
+  if ! forced_position="$(pick_forced_eng_sub_pos "$source")"; then
+    return 22
+  fi
   if [[ -n "$forced_position" ]]; then
     subtitle_codec="$(get_subtitle_codec_by_pos "$source" "$forced_position")"
     case "$SUBTITLE_MODE" in
       burn)
         if subtitle_codec_supports_mov_text "$subtitle_codec"; then
-          subtitle_action=burn
+          subtitle_action=burn_text
         else
-          subtitle_action=extract
-          log_warn "Subtitle codec ${subtitle_codec:-unknown} cannot use the text burn-in filter; extracting a sidecar."
+          subtitle_action=burn_bitmap
+          log_info "Burning bitmap forced subtitle codec ${subtitle_codec:-unknown}."
         fi
         ;;
       copy)
@@ -527,13 +614,17 @@ convert_from_source() {
 
   video_filter="$(build_video_filter_arg "$source" "$subtitle_action" "$forced_position")"
   [[ -n "$video_filter" ]] && filter_arguments=(-vf "$video_filter")
+  if [[ "$subtitle_action" == "burn_bitmap" ]]; then
+    filter_arguments=(-filter_complex "$(build_bitmap_filter_arg "$forced_position")")
+    video_map='[vout]'
+  fi
 
   if [[ "$force_video_encode" != "1" ]] && \
       can_use_fast_video_copy "$source" "$detected_type" "$video_codec" "$subtitle_action"; then
     log_info "Using fast ${video_codec} video-copy path."
     [[ "$video_codec" == "hevc" ]] && video_copy_arguments+=(-tag:v hvc1)
     fast_copy_log="${work_directory}/fast-copy.log"
-    if "$FFMPEG" -y -stats "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
+    if "$FFMPEG" -y "${FFMPEG_PROGRESS_FLAGS[@]}" "${TIMING_IN_FLAGS[@]+"${TIMING_IN_FLAGS[@]}"}" -i "$source" \
         "${TIMING_OUT_FLAGS[@]+"${TIMING_OUT_FLAGS[@]}"}" \
         -map 0:v:0 -copytb 1 "${audio_arguments[@]}" \
         "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
@@ -569,7 +660,7 @@ convert_from_source() {
     fi
   fi
 
-  if ! run_standard_encode "$source" "$output" "$subtitle_action" "$video_bitrate" \
+  if ! run_standard_encode "$source" "$output" "$subtitle_action" "$video_map" "$video_bitrate" \
       "${#audio_arguments[@]}" "${audio_arguments[@]}" \
       "${#subtitle_arguments[@]}" "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
       "${#filter_arguments[@]}" "${filter_arguments[@]+"${filter_arguments[@]}"}"; then

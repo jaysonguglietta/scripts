@@ -1,5 +1,8 @@
 name: Media conversion checks
 
+permissions:
+  contents: read
+
 on:
   push:
     paths:
@@ -13,13 +16,16 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install checks
-        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg jq shellcheck
       - name: Check Bash syntax
-        run: bash -n MediaConversion/convert.sh MediaConversion/lib/*.sh MediaConversion/tests/run.sh MediaConversion/tests/mocks/*
+        run: bash -n MediaConversion/convert.sh MediaConversion/lib/*.sh MediaConversion/tests/*.sh MediaConversion/tests/mocks/*
       - name: Run ShellCheck
-        run: shellcheck -x MediaConversion/convert.sh MediaConversion/lib/*.sh MediaConversion/tests/run.sh MediaConversion/tests/mocks/*
-      - name: Run tests
+        run: shellcheck -x MediaConversion/convert.sh MediaConversion/lib/*.sh MediaConversion/tests/*.sh MediaConversion/tests/mocks/*
+      - name: Run mock regression tests
         run: bash MediaConversion/tests/run.sh
+      - name: Run real FFmpeg integration test
+        run: bash MediaConversion/tests/integration.sh

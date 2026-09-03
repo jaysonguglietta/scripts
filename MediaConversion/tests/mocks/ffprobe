@@ -15,6 +15,9 @@ if [[ "$arguments" == *'stream=index,codec_name,channels:stream_disposition'* ]]
         '1|aac|8|1|1|0|0|0|eng|Director Commentary' \
         '2|ac3|6|0|0|0|0|0|eng|Main Feature'
       ;;
+    commentary-only.mkv)
+      printf '%s\n' '1|aac|2|1|1|0|0|0|eng|Director Commentary'
+      ;;
     und-audio.mkv)
       printf '%s\n' '1|aac|2|1|0|0|0|0|und|Main Audio'
       ;;
@@ -34,8 +37,13 @@ if [[ "$arguments" == *'stream=index,codec_name,channels'* ]]; then
 fi
 
 if [[ "$arguments" == *'stream=index:stream_tags=language'* ]]; then
+  if [[ -n "${MOCK_AUDIO_LANGUAGE:-}" ]]; then
+    printf '%s\n' "1,${MOCK_AUDIO_LANGUAGE}"
+    exit 0
+  fi
   case "$base" in
     und-audio.mkv) printf '%s\n' '1,und' ;;
+    no-audio.mkv) printf '%s\n' '1,fra' ;;
     *) printf '%s\n' '1,eng' ;;
   esac
   exit 0
@@ -46,6 +54,7 @@ if [[ "$arguments" == *'stream_disposition=forced:stream_tags=language,title'* ]
     en-sub.mkv) printf '%s\n' '1|en|English Forced' ;;
     title-sub.mkv) printf '%s\n' '0|und|English Forced' ;;
     image-sub.mkv) printf '%s\n' '1|eng|English Forced PGS' ;;
+    manual-french-sub.mkv) printf '%s\n' '1|fra|French Forced' ;;
     *) : ;;
   esac
   exit 0
@@ -60,7 +69,26 @@ if [[ "$arguments" == *'-select_streams s'* && "$arguments" == *'stream=codec_na
 fi
 
 if [[ "$arguments" == *'-select_streams v:0'* && "$arguments" == *'stream=codec_name'* ]]; then
-  printf '%s\n' h264
+  case "$base" in
+    av1-10bit.mkv) printf '%s\n' av1 ;;
+    *) printf '%s\n' h264 ;;
+  esac
+  exit 0
+fi
+
+if [[ "$arguments" == *'-select_streams v:0'* && "$arguments" == *'stream=pix_fmt'* ]]; then
+  case "$base" in
+    av1-10bit.mkv) printf '%s\n' yuv420p10le ;;
+    *) printf '%s\n' yuv420p ;;
+  esac
+  exit 0
+fi
+
+if [[ "$arguments" == *'-select_streams v:0'* && "$arguments" == *'stream=color_transfer'* ]]; then
+  case "$base" in
+    hdr.mkv) printf '%s\n' smpte2084 ;;
+    *) printf '%s\n' bt709 ;;
+  esac
   exit 0
 fi
 

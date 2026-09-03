@@ -25,6 +25,11 @@ if [[ "${MOCK_TAG_FAIL:-0}" == "1" && "$arguments" == *'-metadata title='* ]]; t
   exit 1
 fi
 
+if [[ "$arguments" == *'-f null -'* ]]; then
+  [[ "${MOCK_DECODE_FAIL:-0}" != "1" ]]
+  exit $?
+fi
+
 if [[ "$arguments" == *fail.mkv* && "$output" == *.mp4 ]]; then
   printf '%s\n' 'mock encoding failure' >&2
   exit 1

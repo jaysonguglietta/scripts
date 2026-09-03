@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-09-03
+
+### Security And Trust Boundaries
+
+- Replaced executable config sourcing with a data-only variable allowlist, enforced owner-only config permissions, and stopped exporting the OMDb key to child processes.
+- Added trusted path checks for the script, libraries, state directory, logs, and configs; root executions now use a fixed system `PATH`.
+- Bounded and schema-validated OMDb responses and local sidecars, sanitized terminal/CSV output, and neutralized spreadsheet formulas.
+- Restricted poster downloads to HTTPS allowlisted hosts, disabled redirects, capped response size, and verified JPEG/PNG signatures.
+- Rejected symlinked/unreadable/control-character inputs and bounded output-name collision attempts.
+
+### Transactional Reliability
+
+- Moved tagging and post-tag validation ahead of final MP4 publication, and added atomic no-clobber publication so strict failures or late filename races cannot overwrite or leave a successful-looking output.
+- Added optional full-decode validation and proportional duration tolerance for long media.
+- Moved per-run audit logs and locks into a private state directory, removed unlocked fallback writes, and protected shared custom lock files from cross-run cleanup races.
+- Added `--existing unique|skip`, `--inspect`, and `--dry-run` workflows.
+- Improved parallel scheduling with `wait -n` on modern Bash while retaining compatibility fallback behavior.
+
+### Media Policies And Performance
+
+- Excluded commentary and accessibility audio by default and enforced language checks on manual audio selections.
+- Enforced forced-English checks on manual subtitle selections, while retaining explicit opt-in overrides for incorrectly tagged media.
+- Added bitmap subtitle burning, PGS `.sup` extraction, safer text-filter path escaping, and overlay end-of-stream handling.
+- Added QSV startup preflight, `auto|off|force` control, a compatibility-first low-power setting, 10-bit `p010le` support, AV1 software-decode/QSV encode support, and clean software fallback.
+- Added HDR preservation through 10-bit software HEVC fallback, optional HDR rejection, one-worker/automatic-thread performance defaults, and quieter FFmpeg logging.
+- Used confirmed episode metadata for TV size policy even when the source filename lacks an `SxxExx` pattern.
+
+### Verification And Documentation
+
+- Expanded deterministic regression coverage from 20 to 35 tests, including adversarial config, metadata, artwork, selection, validation, and strict-publication scenarios.
+- Updated installation, operation, security, cleanup, metadata, stream-selection, QSV/HDR, and troubleshooting documentation.
+
 ## 2026-08-07
 
 ### Metadata Matching
