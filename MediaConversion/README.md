@@ -389,6 +389,10 @@ Exit statuses are `0` for complete success, `1` when configuration or one or mor
 
 Use `VERBOSE=1 --jobs 1` to make a single worker's shell commands easy to follow. Repair and fast-copy diagnostics are also printed when those paths fail.
 
+If FFmpeg reports `File ended prematurely`, the MKV is truncated: its declared container extends beyond the bytes actually present. The converter removes the staged MP4 and stops rather than publishing shortened media. Re-download, force-recheck, or re-copy the source; remuxing can rebuild container indexes but cannot restore missing bytes.
+
+If OMDb proposes the wrong title, year, runtime, or director, reject the match and choose an alternative or manual search. Move an incorrect cached `name.omdb.json` aside and use `--refresh-metadata` to force a new lookup.
+
 If no audio is selected, inspect stream indexes and language tags:
 
 ```bash

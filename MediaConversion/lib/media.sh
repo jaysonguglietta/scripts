@@ -635,6 +635,10 @@ convert_from_source() {
         "${subtitle_arguments[@]+"${subtitle_arguments[@]}"}" \
         "${video_copy_arguments[@]}" "${MP4_OUTPUT_FLAGS[@]}" "$output" \
         2>&1 | tee "$fast_copy_log" >&2; then
+      if log_has_premature_eof "$fast_copy_log"; then
+        rm -f "$output"
+        return 12
+      fi
       if ! log_has_non_monotonic_dts "$fast_copy_log"; then
         if [[ "$subtitle_action" == "extract" ]]; then
           extract_forced_eng_subtitle "$source" "$forced_position" "$subtitle_codec" "${work_directory}/forced-subtitle" || return 10

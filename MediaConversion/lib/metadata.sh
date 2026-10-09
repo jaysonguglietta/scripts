@@ -378,7 +378,7 @@ omdb_automatic_lookup_and_save() {
 
 omdb_interactive_verify_and_save() {
   local filepath="$1" base output_json json="" response answer search_query using_cached=0
-  local match_title match_year match_type match_id
+  local match_title match_year match_type match_id match_runtime match_director
   base="$(basename "$filepath")"
   base="${base%.*}"
   output_json="${filepath%.*}.omdb.json"
@@ -440,9 +440,13 @@ omdb_interactive_verify_and_save() {
     match_year="$(json_string_field "$json" Year 32)"
     match_type="$(json_string_field "$json" Type 16)"
     match_id="$(json_string_field "$json" imdbID 32)"
-    printf '\nOMDb matched: %s (%s) [%s] imdb:%s\n\n' \
+    match_runtime="$(json_string_field "$json" Runtime 64)"
+    match_director="$(json_string_field "$json" Director 256)"
+    printf '\nOMDb matched: %s (%s) [%s] imdb:%s\n' \
       "$(safe_log_text "$match_title")" "$(safe_log_text "$match_year")" \
       "$(safe_log_text "$match_type")" "$(safe_log_text "$match_id")"
+    printf 'Runtime: %s | Director: %s\n\n' \
+      "$(safe_log_text "${match_runtime:-unknown}")" "$(safe_log_text "${match_director:-unknown}")"
     while :; do
       if ! omdb_prompt_read 'Accept this match? (y)es / (n)o, show alternatives / (m)anual search / (k)skip: ' answer; then
         log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."

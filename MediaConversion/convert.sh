@@ -922,6 +922,11 @@ process_one() (
       ;;
   esac
 
+  if [[ "$convert_status" -eq 12 ]]; then
+    log_error "Source appears truncated or incomplete: ${input}"
+    log_error 'FFmpeg reached physical end-of-file before the Matroska container ended. Re-download or re-copy the source; remuxing cannot restore missing bytes.'
+    return 1
+  fi
   if [[ "$convert_status" -ne 0 ]]; then
     log_error "Conversion failed: ${input}"
     return 1

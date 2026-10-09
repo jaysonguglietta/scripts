@@ -43,6 +43,10 @@ if [[ "$arguments" == *nonmonot-new.mkv* && "$arguments" == *'-c:v copy'* ]]; th
   printf '%s\n' 'Non-monotonic DTS; previous: 100, current: 99' >&2
 fi
 
+if [[ "$arguments" == *truncated.mkv* && "$arguments" == *'-c:v copy'* ]]; then
+  printf '%s\n' 'File ended prematurely' >&2
+fi
+
 if [[ "$output" == -* || -z "$output" ]]; then
   printf '%s\n' 'mock ffmpeg could not determine output path' >&2
   exit 2

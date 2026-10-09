@@ -537,6 +537,25 @@ test_oversized_fast_copy_retries_with_encoding() {
   grep -q 'Fast-copy output exceeded its target' "$log_file"
 }
 
+test_premature_eof_is_rejected() {
+  local directory="${TEST_ROOT}/truncated-input" log_file status
+  mkdir -p "$directory"
+  printf input > "${directory}/truncated.mkv"
+  log_file="${directory}/run.log"
+  (
+    cd "$directory" || exit 1
+    PATH="${MOCK_BIN}:${PATH}" QSV_MODE=off \
+    FFMPEG=ffmpeg FFPROBE=ffprobe JOBS=1 FAST_VIDEO_COPY=1 REPAIR_MODE=auto \
+    OMDB_INTERACTIVE=0 MP4_TAG_HEADROOM_BYTES=0 OMDB_API_KEY='' STRICT_DISK_CHECK=0 \
+      "${PROJECT_DIR}/convert.sh" >"$log_file" 2>&1
+  )
+  status=$?
+  assert_equal 1 "$status" 'truncated source batch status' || return 1
+  assert_file_missing "${directory}/truncated.mp4" || return 1
+  grep -q 'Source appears truncated or incomplete' "$log_file" || return 1
+  grep -q 'remuxing cannot restore missing bytes' "$log_file"
+}
+
 test_tagging_failure_preserves_original() {
   command -v jq >/dev/null 2>&1 || return 0
   local directory="${TEST_ROOT}/tag-failure" mp4 sidecar original
@@ -656,6 +675,7 @@ run_test 'image subtitle is burned' test_image_subtitle_is_burned
 run_test 'AV1 10-bit can use QSV with p010' test_av1_10bit_can_use_qsv_with_p010
 run_test 'QSV failure falls back to x264' test_qsv_failure_falls_back_to_x264
 run_test 'oversized fast copy retries with encoding' test_oversized_fast_copy_retries_with_encoding
+run_test 'premature EOF is rejected' test_premature_eof_is_rejected
 run_test 'tagging failure preserves original' test_tagging_failure_preserves_original
 run_test 'strict tagging failure is not published' test_strict_tagging_failure_is_not_published
 run_test 'strict size failure is not published' test_strict_size_failure_is_not_published

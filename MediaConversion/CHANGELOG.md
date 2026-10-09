@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-09
+
+### Input Integrity And Metadata Review
+
+- Detect FFmpeg's `File ended prematurely` diagnostic during fast copy, remove the staged output, and report that the truncated source must be reacquired instead of surfacing a generic duration mismatch.
+- Show runtime and director during interactive OMDb confirmation to make ambiguous or clearly incorrect title matches easier to reject.
+- Add regression coverage and troubleshooting guidance for truncated Matroska inputs.
+
 ## 2026-09-03
 
 ### Security And Trust Boundaries

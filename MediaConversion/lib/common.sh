@@ -335,6 +335,16 @@ log_has_non_monotonic_dts() {
   fi
 }
 
+log_has_premature_eof() {
+  local log_file="$1"
+  [[ -f "$log_file" ]] || return 1
+  if command -v rg >/dev/null 2>&1; then
+    rg -Fqi 'File ended prematurely' "$log_file"
+  else
+    grep -Fqi 'File ended prematurely' "$log_file"
+  fi
+}
+
 ffprobe_duration() {
   local path="$1"
   "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$path" 2>/dev/null | head -n 1
