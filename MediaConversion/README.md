@@ -355,7 +355,7 @@ MEDIA_CONVERSION_CONFIG=/secure/path/media-conversion.env \
 
 The key is removed from the exported environment before media tools start and sent through standard input to `curl`, so it is not included in child environments or process arguments. Do not launch the script with `bash -x`, which can expose config values while they are parsed.
 
-Interactive mode confirms every direct or cached match before conversion. It lets you accept the match, choose from up to eight validated alternatives, enter a manual search, or skip tagging. It stops safely if no terminal is available. Set `OMDB_INTERACTIVE=0` for unattended automatic matching, or `OMDB_CONFIRM_CACHED=0` to keep interactive confirmation for new matches while reusing cached ones.
+Interactive mode confirms every direct or cached match before conversion. It lets you accept the match, choose from up to eight validated alternatives, enter a manual search, or skip tagging. A manual query can use a broad title, an exact title and year such as `Matchbox 2026`, `Matchbox (2026)`, or `Matchbox|2026`, or an IMDb ID such as `tt1234567`. Title-and-year and IMDb-ID inputs use exact OMDb lookups and are confirmed before saving. Interactive mode stops safely if no terminal is available. Set `OMDB_INTERACTIVE=0` for unattended automatic matching, or `OMDB_CONFIRM_CACHED=0` to keep interactive confirmation for new matches while reusing cached ones.
 
 Use `--refresh-metadata` or `OMDB_REFRESH=1` to fetch a new direct match instead of starting with the cached response. Network failures preserve valid existing metadata. Rejected matches are replaced with an empty sidecar and are not silently reused.
 

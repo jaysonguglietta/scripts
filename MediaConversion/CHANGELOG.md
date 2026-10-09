@@ -6,6 +6,7 @@
 
 - Detect FFmpeg's `File ended prematurely` diagnostic during fast copy, remove the staged output, and report that the truncated source must be reacquired instead of surfacing a generic duration mismatch.
 - Show runtime and director during interactive OMDb confirmation to make ambiguous or clearly incorrect title matches easier to reject.
+- Support exact interactive OMDb lookup by title and year or IMDb ID when broad search results omit the intended release.
 - Add regression coverage and troubleshooting guidance for truncated Matroska inputs.
 
 ## 2026-09-03

@@ -273,7 +273,7 @@ test_rejected_omdb_match_is_not_saved() {
   omdb_prompt_read() {
     case "$1" in
       'Accept this match?'*) printf -v "$2" '%s' n ;;
-      'Search OMDb for'*) printf -v "$2" '%s' 0 ;;
+      'Search OMDb'*) printf -v "$2" '%s' 0 ;;
       *) return 1 ;;
     esac
   }
@@ -336,6 +336,32 @@ test_search_result_count_cannot_reach_arithmetic() {
   omdb_search_and_select "${directory}/Movie.mkv" "$output" Movie >/dev/null || return 1
   assert_file_missing "$sentinel" || return 1
   assert_equal '{}' "$(jq -c . "$output")" 'skip metadata output'
+}
+
+test_manual_title_year_uses_exact_lookup() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local directory="${TEST_ROOT}/exact-title-year" output prompt_count=0
+  mkdir -p "$directory"
+  output="${directory}/Matchbox.omdb.json"
+  STRICT_METADATA=0
+  OMDB_RESPONSE_MAX_BYTES=1048576
+  omdb_api_request() {
+    [[ "$*" == 't=Matchbox y=2026' ]] || return 1
+    printf '%s' '{"Response":"True","Title":"Matchbox","Year":"2026","Runtime":"126 min","Director":"Example Director","Type":"movie","imdbID":"tt1234567"}'
+  }
+  omdb_search() { return 1; }
+  omdb_prompt_read() {
+    prompt_count=$((prompt_count + 1))
+    case "$1" in
+      'Search OMDb'*) printf -v "$2" '%s' 'Matchbox 2026' ;;
+      'Use this exact match?'*) printf -v "$2" '%s' y ;;
+      *) return 1 ;;
+    esac
+  }
+  omdb_search_and_select "${directory}/Matchbox.mkv" "$output" '' >/dev/null || return 1
+  assert_equal 2 "$prompt_count" 'manual exact lookup prompt count' || return 1
+  assert_equal Matchbox "$(jq -r .Title "$output")" 'manual exact lookup title' || return 1
+  assert_equal 2026 "$(jq -r .Year "$output")" 'manual exact lookup year'
 }
 
 test_omdb_key_uses_standard_input() {
@@ -666,6 +692,7 @@ run_test 'rejected OMDb match is discarded' test_rejected_omdb_match_is_not_save
 run_test 'lookup failure preserves sidecar' test_lookup_failure_preserves_sidecar
 run_test 'cached metadata is confirmed by default' test_cached_metadata_is_confirmed_by_default
 run_test 'search result count cannot reach arithmetic' test_search_result_count_cannot_reach_arithmetic
+run_test 'manual title and year use exact lookup' test_manual_title_year_uses_exact_lookup
 run_test 'OMDb key uses standard input' test_omdb_key_uses_standard_input
 run_test 'poster MIME controls extension' test_poster_mime_controls_extension
 run_test 'duration and decode validation' test_duration_and_decode_validation

@@ -216,6 +216,50 @@ omdb_fetch_by_id() {
   omdb_api_request "i=$1"
 }
 
+omdb_exact_lookup_from_query() {
+  local query normalized title="" year=""
+  query="$(trim_whitespace "$1")"
+  normalized="$(lowercase "$query")"
+
+  if [[ "$normalized" =~ ^tt[0-9]+$ ]]; then
+    omdb_fetch_by_id "$normalized"
+    return $?
+  fi
+
+  if [[ "$query" =~ ^(.+)[[:space:]]+\(([12][0-9]{3})\)$ ]]; then
+    title="${BASH_REMATCH[1]}"
+    year="${BASH_REMATCH[2]}"
+  elif [[ "$query" =~ ^(.+)[[:space:]]+([12][0-9]{3})$ ]]; then
+    title="${BASH_REMATCH[1]}"
+    year="${BASH_REMATCH[2]}"
+  elif [[ "$query" =~ ^(.+)[[:space:]]*[|][[:space:]]*([12][0-9]{3})$ ]]; then
+    title="${BASH_REMATCH[1]}"
+    year="${BASH_REMATCH[2]}"
+  else
+    return 3
+  fi
+
+  title="$(trim_whitespace "$title")"
+  [[ -n "$title" ]] || return 1
+  omdb_api_request "t=$title" "y=$year"
+}
+
+print_omdb_match_summary() {
+  local json="$1" label="${2:-OMDb matched}"
+  local title year type imdb_id runtime director
+  title="$(json_string_field "$json" Title 512)"
+  year="$(json_string_field "$json" Year 32)"
+  type="$(json_string_field "$json" Type 16)"
+  imdb_id="$(json_string_field "$json" imdbID 32)"
+  runtime="$(json_string_field "$json" Runtime 64)"
+  director="$(json_string_field "$json" Director 256)"
+  printf '\n%s: %s (%s) [%s] imdb:%s\n' \
+    "$label" "$(safe_log_text "$title")" "$(safe_log_text "$year")" \
+    "$(safe_log_text "$type")" "$(safe_log_text "$imdb_id")"
+  printf 'Runtime: %s | Director: %s\n\n' \
+    "$(safe_log_text "${runtime:-unknown}")" "$(safe_log_text "${director:-unknown}")"
+}
+
 omdb_prompt_read() {
   local prompt="$1" variable_name="$2"
   if [[ -t 0 ]]; then
@@ -246,11 +290,11 @@ save_metadata_skip() {
 omdb_search_and_select() {
   local filepath="$1" output="$2" initial_query="$3"
   local search_query="$initial_query" search_json result_count shown choice selected_id selected_json
-  local row display_index
+  local row display_index exact_json exact_status exact_answer
 
   while :; do
     if [[ -z "$search_query" ]]; then
-      if ! omdb_prompt_read 'Search OMDb for (enter 0 to skip): ' search_query; then
+      if ! omdb_prompt_read 'Search OMDb (title, "Title 2026", IMDb ID, or 0 to skip): ' search_query; then
         log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."
         return 1
       fi
@@ -261,6 +305,45 @@ omdb_search_and_select() {
       fi
       if [[ -z "$search_query" ]]; then
         printf 'Please enter a search query or 0 to skip.\n'
+        continue
+      fi
+    fi
+
+    exact_json=""
+    if exact_json="$(omdb_exact_lookup_from_query "$search_query")"; then
+      if json_string_is_confirmed_match "$exact_json"; then
+        print_omdb_match_summary "$exact_json" 'Exact OMDb match'
+        while :; do
+          if ! omdb_prompt_read 'Use this exact match? (y)es / (n)o, or (k)skip: ' exact_answer; then
+            log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."
+            return 1
+          fi
+          case "$(lowercase "$exact_answer")" in
+            y|yes)
+              write_json_atomically "$output" "$exact_json"
+              return $?
+              ;;
+            n|no)
+              search_query=""
+              break
+              ;;
+            k|skip)
+              save_metadata_skip "$output"
+              return $?
+              ;;
+            *) printf 'Please answer y, n, or k.\n' ;;
+          esac
+        done
+        continue
+      fi
+      printf '\nNo exact OMDb result for: %s\n\n' "$(safe_log_text "$search_query")"
+      search_query=""
+      continue
+    else
+      exact_status=$?
+      if [[ "$exact_status" -ne 3 ]]; then
+        log_warn "Exact OMDb lookup failed for ${search_query}."
+        search_query=""
         continue
       fi
     fi
@@ -378,7 +461,6 @@ omdb_automatic_lookup_and_save() {
 
 omdb_interactive_verify_and_save() {
   local filepath="$1" base output_json json="" response answer search_query using_cached=0
-  local match_title match_year match_type match_id match_runtime match_director
   base="$(basename "$filepath")"
   base="${base%.*}"
   output_json="${filepath%.*}.omdb.json"
@@ -436,17 +518,7 @@ omdb_interactive_verify_and_save() {
   fi
 
   if [[ "$response" == "True" ]]; then
-    match_title="$(json_string_field "$json" Title 512)"
-    match_year="$(json_string_field "$json" Year 32)"
-    match_type="$(json_string_field "$json" Type 16)"
-    match_id="$(json_string_field "$json" imdbID 32)"
-    match_runtime="$(json_string_field "$json" Runtime 64)"
-    match_director="$(json_string_field "$json" Director 256)"
-    printf '\nOMDb matched: %s (%s) [%s] imdb:%s\n' \
-      "$(safe_log_text "$match_title")" "$(safe_log_text "$match_year")" \
-      "$(safe_log_text "$match_type")" "$(safe_log_text "$match_id")"
-    printf 'Runtime: %s | Director: %s\n\n' \
-      "$(safe_log_text "${match_runtime:-unknown}")" "$(safe_log_text "${match_director:-unknown}")"
+    print_omdb_match_summary "$json"
     while :; do
       if ! omdb_prompt_read 'Accept this match? (y)es / (n)o, show alternatives / (m)anual search / (k)skip: ' answer; then
         log_error "OMDb confirmation requires a terminal for ${filepath}. Re-run interactively or set OMDB_INTERACTIVE=0."
